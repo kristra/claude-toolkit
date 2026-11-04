@@ -100,13 +100,39 @@ The gate advances the DAG automatically; your job per stop:
   `/until ask --approval --command "..."` and continue whatever is not
   blocked. Production deploys are NEVER yours to trigger.
 
+**Pre-approved — never ask, never park for these:** committing and pushing
+a non-default fix/feature branch (signed per repo convention), opening or
+updating the PR, and re-running flaky CI. These are reversible. The consent
+moments are merging, deploying, force-pushes, deletions, and anything
+touching data or systems outside the repo. (First-run evidence: a push
+question cost a 25-minute stall that this rule deletes.)
+
+**UI verification runs on jev, not by hand.** For any phase or probe that
+only a browser can answer (rendering, login flows, error toasts — API facts
+stay curl), use jev on the dev server per the **nimbly:jev-browser** skill;
+this instruction constitutes the explicit request its trigger requires.
+jev executes, the gate judges: write the probe as `jev python <script>` that
+navigates with agent actions and ends in deterministic asserts (`page.url`,
+`page.run(js)`); its exit code is the check. Never drive staging click-by-
+click through browser MCP tools when a jev probe can do it headless on dev.
+
 ## Phase 6 — close
 
-When the final phase's goal is met: update the ticket memory file (status,
-PRs, amend_log summary if "done" evolved, claims worth keeping), remind the
-user of any judgment-only review items from Phase 2, and — only if they
-ask — comment status on the card. Queue cleanup commands (branch deletion,
-worktree removal) as approvals where they are destructive.
+When the final phase's goal is met, the hand-off message is part of the
+contract. Its FIRST LINE is the deliverable, unambiguous and complete:
+
+> PR <url> — OPEN, checks 6/6 green, awaiting your review/approval.
+
+(or the equivalent for a non-PR deliverable). Then, in order: judgment-only
+review items from Phase 2, any still-open approvals with their `!` commands,
+and one line on where the evidence lives (ticket memory, amend_log). The
+user must never have to ask "so where's the PR?" — if they could, the
+close-out failed regardless of the work's quality.
+
+Also: update the ticket memory file (status, PRs, amend_log summary if
+"done" evolved, claims worth keeping), and — only if they ask — comment
+status on the card. Queue cleanup commands (branch deletion, worktree
+removal) as approvals where they are destructive.
 
 ## Shadow sampling — calibrate the router with data
 

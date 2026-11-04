@@ -153,6 +153,21 @@ def writeback_phase(state, phase):
                 state[dst] = phase[src]
 
 
+def normalize_claims(state):
+    """Enforce claim semantics: 'verified' requires a verify_cmd.
+
+    A claim nobody can re-check is an inference, whatever the writer called
+    it. Demote silently (logged) so it can never gate a phase as a fact.
+    """
+    demoted = []
+    for c in (state.get("claims") or []):
+        if c.get("status") == "verified" and not c.get("verify_cmd"):
+            c["status"] = "inference"
+            demoted.append(c.get("claim", "?")[:60])
+    if demoted:
+        log("claims_demoted", state, extra={"claims": demoted})
+
+
 def stale_claims(state):
     now = time.time()
     due = [
@@ -226,6 +241,7 @@ def main():
         sys.exit(0)
 
     state.setdefault("session_id", session_id)
+    normalize_claims(state)
     questions = state.get("questions") or []
     open_blocking = [
         q for q in questions
