@@ -69,6 +69,14 @@ Routing rule (mechanical, no vibes):
 - Trivial phases (config bump, doc edit) you do yourself — delegation
   overhead would exceed the work.
 
+Record every routing decision durably: set the phase's `tier` field in
+the state file when you route it, and append one line to
+`~/.claude/until/routing-stats.jsonl` for EVERY routed phase (not only
+shadow samples) — `{ts, ticket, phase, tier, model, brief_lint: "pass|gap",
+tokens, duration_s, outcome}` using the numbers from the agent's task
+notification. The router can only become data-driven if the routine
+decisions are logged, not just the experiments.
+
 While an agent runs, do not duplicate its work; prepare the next phase's
 checks or clear approval-queue candidates.
 
