@@ -1,0 +1,21 @@
+{
+  "_comment": "Merge BOTH keys into ~/.claude/settings.json — the /until skill's goal gate (hooks.Stop) and the allow rule that lets the in-session model arm the loop (permissions.allow). Assumes the skill is installed at ~/.claude/skills/until.",
+  "permissions": {
+    "allow": [
+      "Edit(//Users/nimbly/.claude/until/state/**)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/nimbly/.claude/skills/until/hooks/until-gate.py",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  }
+}

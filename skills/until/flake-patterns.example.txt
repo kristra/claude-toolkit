@@ -1,0 +1,19 @@
+# Copy to ~/.claude/until/flake-patterns.txt — one regex per line (case-insensitive).
+# When a failing check's output matches, the gate re-runs the check once, free.
+# Only add ENVIRONMENTAL failure signatures; never anything that could mask a
+# real failure of the thing being checked.
+
+# testcontainers / docker port collisions on shared self-hosted runners
+# (seen: api-statistics pact-provider, ping.integration.test)
+failed to bind host port .* address already in use
+driver failed programming external connectivity
+
+# transient registry / network blips
+ECONNRESET
+ETIMEDOUT
+socket hang up
+registry\.npmjs\.org.*(503|ENOTFOUND)
+
+# GitHub API transient errors during gh polls
+API rate limit exceeded
+had issues while fetching
