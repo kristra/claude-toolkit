@@ -129,7 +129,11 @@ command that re-verifies it:
 - A claim you cannot express as a command is an **inference**: record it
   with `"status": "inference"` and no `verify_cmd`. Inferences never gate,
   and you must not treat them as facts later — turn them into a
-  verification task or an open question instead.
+  verification task or an open question instead. The gate **enforces** this:
+  a claim marked `verified` without a `verify_cmd` is silently demoted to
+  `inference` (logged as `claims_demoted`). "I checked it by hand" does not
+  count — if it mattered enough to check, write the command you checked
+  it with.
 
 ## Approvals — the non-blocking human queue
 
@@ -221,6 +225,14 @@ needed, and continue. For multi-day waits the user can run a standing
   comparison against a target number
 - **Staging deploy live**: `curl -fsS <staging-health-url>` or a version
   probe comparing the deployed hash
+- **UI renders correctly** (when only a browser can tell — rendering, login
+  flows, error toasts; API-level facts stay curl):
+  `ssh <you>@dev.skynet.nimbly 'jev python <probe>.py'` — the probe
+  navigates with jev agent actions (headless, logged-in via JEV_SECRETS,
+  `jev chrome start` keeps the session across re-checks) and ends in
+  **deterministic asserts** (`page.url`, `page.run(js)` reading the DOM);
+  the assert is the exit code. jev executes, it never judges — see the
+  nimbly:jev-browser skill for the probe API.
 
 ## Limits and safety
 

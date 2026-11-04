@@ -116,6 +116,15 @@ check("failed claim blocks", r.get("decision") == "block"
       and "no longer verifies" in r.get("reason", ""))
 check("claim marked failed", s["claims"][0]["status"] == "failed")
 
+# 8b. command-less "verified" claim is demoted to inference and never gates
+write({**base, "check_cmd": "false", "max_tries": 3, "tries_used": 0,
+       "claims": [{"id": 1, "claim": "checked it by hand, trust me",
+                   "verified_at": 0, "status": "verified"}]})
+r = gate()
+s = read()
+check("claim demoted to inference", s["claims"][0]["status"] == "inference")
+check("demoted claim does not gate", "no longer verifies" not in r.get("reason", ""))
+
 # 9. approvals do not park; blocking question does
 write({**base, "check_cmd": "false", "max_tries": 5, "tries_used": 0,
        "questions": [{"id": 1, "type": "approval", "q": "delete branch",
