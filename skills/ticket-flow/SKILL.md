@@ -1,23 +1,24 @@
 ---
 name: ticket-flow
-description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "continue 2983", "work on ticket 2962" — and drives the phased loop workflow (context pull, gap scan, executable done-contract, /until goal loops, parked questions) so the user never has to invoke /until manually. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
+description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "continue 2983", "work on ticket 2962" — and drives the orchestrated loop workflow (context pull, gap scan, phase-DAG done-contract, tiered agent routing, independent verification, /until goal loops, approval queue) so the user's role reduces to async approvals and scope decisions. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
 ---
 
-# ticket-flow — seamless Fizzy ticket workflow with goal loops
+# ticket-flow — orchestrated Fizzy ticket workflow
 
 When the user starts or resumes ticket work, run this flow without being
-asked to. The user should never need to type `/until`; arming, parking,
-amending and re-arming are your job. Announce each phase transition in one
-line so the user can object.
+asked to. The user should never need to type `/until`; arming, advancing,
+parking, amending and re-arming are your job. You are the **orchestrator**:
+you plan, route work to agents, verify, and keep the loop honest. Announce
+each phase transition in one line so the user can object.
 
 ## Phase 0 — context (always)
 
 1. Pull the card + all comments via the **fizzy** skill.
 2. Check the per-ticket memory file (ticket workflow convention) and any
    HANDOFF doc it points to; create the memory file if this is first contact.
-3. If an `/until status` shows a parked loop for this ticket: fetch new card
-   comments, record any answers (`/until answer`), amend the check if needed,
-   and resume where it left off. Skip the rest of Phase 0.
+3. If `/until status` shows a parked or in-flight loop for this ticket:
+   fetch new card comments, record any answers (`/until answer`), amend
+   checks if needed, and resume the active phase. Skip the rest of Phase 0.
 
 ## Phase 1 — gap scan (before writing any code)
 
@@ -25,48 +26,122 @@ List what the ticket under-specifies as concrete either/or questions.
 Then split them:
 - **User-decidable now** → ask in one batch (AskUserQuestion or banner).
 - **Reporter/product questions** → these go to the card via `/until ask`
-  once the loop is armed in Phase 2 (ask posts them as card comments).
+  once the loop is armed (ask posts them as card comments).
 - If nothing is ambiguous, say so in half a sentence and move on.
 
-## Phase 2 — the done-contract, then arm
+## Phase 2 — compile the done-contract as a phase DAG, then arm ONCE
 
-1. Express the acceptance criteria as an **executable check** — a failing
-   test, an E2E probe script, or a curl assertion. If a criterion resists
-   being made executable, that is a Phase 1 question you missed — go ask.
-   Keep genuinely judgment-only criteria (UX feel, design fidelity) out of
-   the check and list them for the user's final review instead.
-2. Show the check in one line; unless the user objects, arm the loop
-   (the **until** skill, `fizzy_card` set to the ticket number). Budgets:
-   `--tries 3` while requirements are shaky, 5 for implementation,
-   8–10 for CI babysit phases.
+1. Express the whole ticket as `phases` in one `/until` state file (see the
+   until skill's multi-phase form). Typical DAG:
+   `impl` (contract test green) → `hygiene` (repo coverage/test gate) →
+   `pr-ci` (PR checks green) → `staging` (health/version/E2E probe) →
+   optionally `post-deploy` (alert-quiet probe, log scan). Multi-repo
+   tickets: one phase per repo in deploy order, staging version-probes
+   between them.
+2. Every criterion becomes an executable check. If one resists being made
+   executable, that is a Phase 1 question you missed — go ask. Keep
+   genuinely judgment-only criteria (UX feel, design fidelity) out of the
+   checks and list them for the user's final review instead.
+3. Record every fact the plan rests on as a **claim** with a `verify_cmd`
+   (`/until claim`). A fact you inferred but did not measure is an
+   inference — it must not gate anything until measured.
+4. Show the DAG in a few lines; unless the user objects, arm the loop
+   (`fizzy_card` set). Try budgets: 3 while requirements are shaky, 5 for
+   implementation phases, 8–10 for CI/deploy babysit phases.
 
-## Phase 3 — work the phases, re-arming as each completes
+## Phase 3 — route the work (tiered execution)
 
-Typical progression, each with its own goal/check:
-1. **fix-until-green**: the contract test passes locally.
-2. **repo hygiene**: the repo's coverage/test gate passes (the Nimbly
-   catch-untested-code skill still applies at commit time).
-3. **PR green**: `gh pr checks <n> --repo Nimbly-Technologies/<repo>`;
-   multi-repo tickets: respect deploy order, arm a staging version-probe on
-   the first repo before merging the second.
-4. **staging verified**: health/version/E2E probe against staging.
+For each implementation phase, write a **brief** before touching code. A
+brief is routable to the cheap tier only if it contains ALL FOUR:
+1. the files to touch,
+2. the exact target shape (code snippets, schema, naming),
+3. the constraints (what NOT to touch, repo rules, commit/push etiquette),
+4. the verification commands the implementer must run.
 
-Hitting an ambiguity mid-phase → `/until ask` (parks the loop, posts to the
-card), tell the user in one line, and stop cleanly. Never guess around a
-parked question, and never let the check pass stand in for an unanswered
-one.
+Routing rule (mechanical, no vibes):
+- **Brief passes the 4-point lint** → delegate to a cheap executor
+  (Agent tool, `model: "haiku"`), background, isolated worktree.
+- **Brief has gaps you cannot close** → either do more root-cause work
+  yourself until it passes the lint, or delegate to the expensive tier
+  (`model: "opus"`) with an explicit extra charter: "enumerate adjacent
+  unknowns this brief does not cover; verify each with a measurement, and
+  report them as claims with verify commands."
+- Trivial phases (config bump, doc edit) you do yourself — delegation
+  overhead would exceed the work.
 
-## Phase 4 — close
+While an agent runs, do not duplicate its work; prepare the next phase's
+checks or clear approval-queue candidates.
+
+## Phase 4 — independent verification (after every implementation phase)
+
+Spawn a **fresh-context verifier** (cheap tier is fine) that receives the
+diff and the done-contract — NEVER the implementer's reasoning or your own
+conclusions, to avoid anchoring. Use the charter in `verifier-prompt.md`
+(same folder). The verifier returns:
+- confirmed/refuted findings → feed real ones back to the implementer
+  agent (SendMessage) and re-run the phase;
+- **assumption list**: load-bearing assumptions the brief never stated,
+  each with a shell command that would verify it → record each as a claim
+  (`/until claim`); commands needing credentials/permissions you lack go to
+  the approval queue instead.
+Escalate to an expensive-tier verifier only when implementer and verifier
+disagree and you cannot adjudicate with a measurement.
+
+## Phase 5 — babysit to done
+
+The gate advances the DAG automatically; your job per stop:
+- failures: fix, or relay to the owning agent; trust the gate's flake
+  retry and NEVER re-loop an identical failure — the gate flags those;
+  change approach, tier up, or park.
+- approvals: when the gate prints the pending queue, surface it to the
+  user in the standard banner once per batch, not per stop.
+- hard human gates (PR 4-eyes approval, production deploy dispatch,
+  credential grants, destructive ops): queue via
+  `/until ask --approval --command "..."` and continue whatever is not
+  blocked. Production deploys are NEVER yours to trigger.
+
+## Phase 6 — close
 
 When the final phase's goal is met: update the ticket memory file (status,
-PRs, amend_log summary if "done" evolved), remind the user of any
-judgment-only review items from Phase 2, and — only if they ask — comment
-status on the card.
+PRs, amend_log summary if "done" evolved, claims worth keeping), remind the
+user of any judgment-only review items from Phase 2, and — only if they
+ask — comment status on the card. Queue cleanup commands (branch deletion,
+worktree removal) as approvals where they are destructive.
+
+## Shadow sampling — calibrate the router with data
+
+For roughly **1 in 5 routine implementation phases** (deterministic rule:
+`ticket_number % 5 == 0`), also spawn a shadow agent of the OTHER tier with
+the identical brief, in an isolated worktree, with explicit instructions:
+**no PR, no push, no ticket/doc writes** — the shadow's diff dies with its
+worktree. When both finish, append one JSON line to
+`~/.claude/until/routing-stats.jsonl`:
+
+```json
+{"ts": 0, "ticket": 3126, "phase": "impl", "primary": "opus",
+ "shadow": "haiku", "primary_tokens": 0, "shadow_tokens": 0,
+ "primary_s": 0, "shadow_s": 0,
+ "diff_equivalent": true, "shadow_missed": "<what only primary caught>",
+ "primary_missed": "<what only shadow caught>"}
+```
+
+(Token/duration numbers come from the agents' task notifications.) Skip
+sampling when the phase is credential-heavy, touches production, or the
+user asked for speed. Periodically (or when asked), summarize the stats
+file: if the cheap tier matches the expensive one on ≥90% of sampled
+briefs that passed the 4-point lint, the lint is calibrated; where shadows
+diverge, tighten the lint with whatever the brief was missing.
 
 ## Boundaries
 
 - Investigation-only requests ("why does X happen?") get the
   investigate-bug treatment, not loops — report findings, don't arm.
-- Approvals, 4-eyes gates, destructive migrations: never inside a check;
-  surface them to the user.
-- One armed goal at a time; finish or cancel before re-arming.
+- Approvals, 4-eyes gates, destructive migrations, production deploys:
+  never inside a check, never executed by you or an agent on your behalf —
+  approval queue only. A permission-classifier denial is routed to the
+  queue, never retried and never handed to another agent (that is
+  permission laundering).
+- One armed state file at a time; the DAG replaces sequential re-arming.
+- Claims discipline: when you catch yourself writing "evidently",
+  "presumably", or "should already" about something gating a decision —
+  that is an inference; measure it or ledger it as one.
