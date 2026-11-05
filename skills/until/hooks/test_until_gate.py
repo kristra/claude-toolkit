@@ -116,7 +116,25 @@ check("failed claim blocks", r.get("decision") == "block"
       and "no longer verifies" in r.get("reason", ""))
 check("claim marked failed", s["claims"][0]["status"] == "failed")
 
-# 8b. command-less "verified" claim is demoted to inference and never gates
+# 8b. a failed claim keeps blocking on the next stop (no one-stop bypass)
+write({**base, "check_cmd": "true", "max_tries": 3, "tries_used": 0,
+       "claims": [{"id": 1, "claim": "still false", "verify_cmd": "false",
+                   "verified_at": 0, "status": "failed"}]})
+r = gate()
+s = read()
+check("failed claim re-blocks", r.get("decision") == "block"
+      and "no longer verifies" in r.get("reason", ""))
+check("failed claim state survives", s is not None
+      and s["claims"][0]["status"] == "failed")
+
+# 8c. a failed claim self-heals when its verify passes again
+write({**base, "check_cmd": "true", "max_tries": 3, "tries_used": 0,
+       "claims": [{"id": 1, "claim": "world got fixed", "verify_cmd": "true",
+                   "verified_at": 0, "status": "failed"}]})
+r = gate()
+check("failed claim self-heals", "goal met" in r.get("systemMessage", ""))
+
+# 8d. command-less "verified" claim is demoted to inference and never gates
 write({**base, "check_cmd": "false", "max_tries": 3, "tries_used": 0,
        "claims": [{"id": 1, "claim": "checked it by hand, trust me",
                    "verified_at": 0, "status": "verified"}]})

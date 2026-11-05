@@ -169,12 +169,18 @@ def normalize_claims(state):
 
 
 def stale_claims(state):
+    """Claims due for re-verification: stale ones, plus any marked failed.
+
+    A failed claim stays due on every stop, so a phase can never complete
+    past it: it keeps blocking until its verify passes again (self-heal) or
+    the model corrects/reclassifies the claim entry.
+    """
     now = time.time()
     due = [
         c for c in (state.get("claims") or [])
         if c.get("verify_cmd")
-        and c.get("status") != "failed"
-        and now - float(c.get("verified_at") or 0) > CLAIM_MAX_AGE_SECONDS
+        and (c.get("status") == "failed"
+             or now - float(c.get("verified_at") or 0) > CLAIM_MAX_AGE_SECONDS)
     ]
     due.sort(key=lambda c: float(c.get("verified_at") or 0))
     return due[:CLAIMS_PER_RUN]
