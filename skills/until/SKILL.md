@@ -125,7 +125,10 @@ command that re-verifies it:
 - Before a phase is allowed to complete, the gate re-runs stale claims
   (older than 1h, up to 3 per stop). A failing claim **blocks the advance**
   with instructions to re-establish it — a phase never completes on an
-  invalidated premise.
+  invalidated premise. A claim that failed stays due: it is re-verified on
+  every subsequent stop and keeps blocking until it verifies again (fixing
+  the world is enough — no state edit needed) or you correct/reclassify
+  the claim entry.
 - A claim you cannot express as a command is an **inference**: record it
   with `"status": "inference"` and no `verify_cmd`. Inferences never gate,
   and you must not treat them as facts later — turn them into a
