@@ -25,14 +25,26 @@ Extras, all deterministic:
   - approvals: open questions of type "approval" (blocking=false by default)
     never park the loop; they are surfaced on every message so the human can
     run them asynchronously. Plain questions still park as in v1.
+  - check integrity: the first time a phase is evaluated, its check command
+    and the content hash of every local script it invokes are pinned in
+    ~/.claude/until/pins/<session>.json (outside the state file, so a re-arm
+    cannot reset them). A later change to the command or a pinned script
+    fails the check unless an amend_log entry for that phase is newer than
+    the pin; an amend that drops every live probe (curl, ssh, gh, test
+    runners...) for a local file read additionally needs "user_approved".
+  - route logging: a phase with a delegated "tier" cannot complete until
+    routing-stats.jsonl holds a "finish" row for it (written by
+    ticket-flow/log-route.py), so routing data cannot silently go missing.
 
 State files live in ~/.claude/until/state/<session_id>.json (_fallback.json
 when the in-session skill could not determine its session id). Set
 UNTIL_STATE_DIR to override the directory (used by tests).
 """
+import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -42,6 +54,10 @@ STATE_DIR = os.environ.get(
 LOG_PATH = os.path.join(os.path.dirname(STATE_DIR), "log.jsonl")
 FLAKE_PATTERNS_PATH = os.path.join(
     os.path.dirname(STATE_DIR), "flake-patterns.txt")
+PINS_DIR = os.path.join(os.path.dirname(STATE_DIR), "pins")
+ROUTING_PATH = os.environ.get(
+    "UNTIL_ROUTING_PATH",
+    os.path.join(os.path.dirname(STATE_DIR), "routing-stats.jsonl"))
 MAX_AGE_SECONDS = 24 * 3600
 PARKED_MAX_AGE_SECONDS = 7 * 24 * 3600  # open decisions can take days
 OUTPUT_TAIL_CHARS = 1200
@@ -49,6 +65,15 @@ CLAIM_MAX_AGE_SECONDS = 3600      # re-verify load-bearing claims older than thi
 CLAIMS_PER_RUN = 3                # at most this many claim re-checks per stop
 CLAIM_TIMEOUT_DEFAULT = 30
 TOTAL_BUDGET_SECONDS = 150        # stay under the Stop-hook timeout
+SELF_TIERS = (None, "", "self", "none")   # phases the orchestrator did itself
+ROUTE_LOG_MAX_NAGS = 2            # then let the phase complete, logged
+# A check containing none of these only inspects local state the model can
+# write itself (a file it produced, a script it can edit).
+LIVE_PROBE_RE = re.compile(
+    r"(https?://|\b(curl|wget|ssh|scp|gh|git\s+(fetch|ls-remote)|adb|jev|"
+    r"mongosh|psql|mysql|redis-cli|aws|gcloud|kubectl|nc|ping|dig|"
+    r"jest|vitest|pytest|mocha|tsc|eslint|ruff|mypy|npx|pnpm|npm|yarn|uv|"
+    r"cargo|go\s+test|mvn|gradle|make|terraform)\b)")
 _START = time.monotonic()
 
 
@@ -219,6 +244,184 @@ def approvals_note(state):
             + "\n".join(lines))
 
 
+INTERPRETERS = {"bash", "sh", "zsh", "python", "python3", "node", "ruby",
+                "perl", "osascript"}
+
+
+def _script_paths(cmd, cwd, depth=0):
+    """Local scripts a check command executes (not the files it reads).
+
+    Only executed code is pinned: test files and data files legitimately
+    change while the work proceeds; the script that judges it must not.
+    """
+    found = []
+    try:
+        lex = shlex.shlex(cmd.replace("\n", ";"), posix=True,
+                          punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        stream = list(lex)
+    except ValueError:
+        stream = cmd.split()
+    segments, cur = [], []
+    for tok in stream:
+        if tok and set(tok) <= set(";&|()<>"):
+            segments.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    segments.append(cur)
+    for tokens in segments:
+        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            tokens = tokens[1:]  # env assignments
+        if not tokens:
+            continue
+        if tokens[0] == "cd" and len(tokens) > 1:
+            cwd = os.path.join(cwd or os.getcwd(), os.path.expanduser(tokens[1]))
+            continue
+        target = None
+        if os.path.basename(tokens[0]) in INTERPRETERS:
+            rest = tokens[1:]
+            while rest:
+                tok = rest.pop(0)
+                if tok == "-c" and rest:
+                    if depth < 2:
+                        found += _script_paths(rest[0], cwd, depth + 1)
+                    break
+                if tok in ("-o", "-m", "-W", "-X"):
+                    rest = rest[1:]
+                elif not tok.startswith("-"):
+                    target = tok
+                    break
+        elif "/" in tokens[0]:
+            target = tokens[0]
+        if target:
+            path = os.path.expanduser(target)
+            if not os.path.isabs(path):
+                path = os.path.join(cwd or os.getcwd(), path)
+            if os.path.isfile(path) and os.path.getsize(path) < 2_000_000:
+                found.append(os.path.realpath(path))
+    return sorted(set(found))
+
+
+def _sha(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
+
+
+def _is_live(cmd, paths):
+    """Does the check (or a script it runs) probe something beyond local files?"""
+    if LIVE_PROBE_RE.search(cmd):
+        return True
+    for path in paths:
+        try:
+            with open(path, errors="ignore") as f:
+                if LIVE_PROBE_RE.search(f.read(200_000)):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _load_pins(state):
+    path = os.path.join(PINS_DIR, f"{state.get('session_id') or '_fallback'}.json")
+    try:
+        with open(path) as f:
+            pins = json.load(f)
+    except Exception:
+        pins = {}
+    if pins.get("goal") != state.get("goal"):
+        pins = {"goal": state.get("goal"), "phases": {}}  # a new loop
+    return path, pins
+
+
+def drop_pins(state):
+    try:
+        os.remove(os.path.join(
+            PINS_DIR, f"{state.get('session_id') or '_fallback'}.json"))
+    except Exception:
+        pass
+
+
+def integrity_check(state, phase, cwd):
+    """Pin the check on first sight; refuse unrecorded changes afterwards.
+
+    Returns None when the check may run, else an explanation (treated as a
+    failed check, so it burns a try and the loop stays bounded).
+    """
+    pins_path, pins = _load_pins(state)
+    cmd = phase["check_cmd"]
+    paths = _script_paths(cmd, cwd)
+    hashes = {p: _sha(p) for p in paths}
+    current = {"cmd": cmd, "hashes": hashes, "live": _is_live(cmd, paths),
+               "pinned_at": time.time()}
+    pin = pins["phases"].get(phase["id"])
+
+    if pin and pin["cmd"] == cmd and all(
+            hashes.get(p) == h for p, h in pin["hashes"].items()):
+        return None  # unchanged
+
+    if pin:
+        amends = [
+            a for a in (state.get("amend_log") or [])
+            if (a.get("phase") or "_single") == phase["id"]
+            and float(a.get("ts") or 0) > float(pin["pinned_at"])
+        ]
+        changed = ("command" if pin["cmd"] != cmd else
+                   "script " + ", ".join(p for p, h in pin["hashes"].items()
+                                         if hashes.get(p) != h))
+        if not amends:
+            log("check_tampered", state, extra={"phase": phase["id"],
+                                                "changed": changed})
+            return (f"INTEGRITY: the check for phase \"{phase['id']}\" changed "
+                    f"({changed}) since it was pinned, with no amend_log entry "
+                    f"recording why. Revert the change, or record it with "
+                    f"`/until amend --phase {phase['id']}` (old/new check + "
+                    f"reason). Pinned command: {pin['cmd']}")
+        if pin.get("live") and not current["live"] and not any(
+                a.get("user_approved") for a in amends):
+            log("check_downgraded", state, extra={"phase": phase["id"]})
+            return (f"INTEGRITY: the amended check for phase \"{phase['id']}\" "
+                    f"no longer probes anything live (it only reads local "
+                    f"files/scripts you can write), while the pinned one did: "
+                    f"{pin['cmd']}\nThat turns the gate into self-attestation. "
+                    f"Restore a live probe, or ask the user; only after they "
+                    f"explicitly agree, set \"user_approved\": true on the "
+                    f"amend_log entry.")
+        log("check_repinned", state, extra={"phase": phase["id"]})
+
+    pins["phases"][phase["id"]] = current
+    try:
+        os.makedirs(PINS_DIR, exist_ok=True)
+        with open(pins_path, "w") as f:
+            json.dump(pins, f)
+    except Exception:
+        pass
+    return None
+
+
+def route_logged(state, phase):
+    """True when a delegated phase has its routing 'finish' row recorded."""
+    if phase.get("tier") in SELF_TIERS:
+        return True
+    try:
+        with open(ROUTING_PATH) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if (row.get("event") == "finish"
+                        and row.get("session") == state.get("session_id")
+                        and row.get("phase") == phase["id"]):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def save(state_path, state):
     with open(state_path, "w") as f:
         json.dump(state, f)
@@ -258,6 +461,7 @@ def main():
     age = time.time() - float(state.get("created_at", 0))
     if age > (PARKED_MAX_AGE_SECONDS if open_blocking else MAX_AGE_SECONDS):
         os.remove(state_path)
+        drop_pins(state)
         log("expired", state)
         out({"systemMessage": "until: stale goal state discarded: "
                               + str(state.get("goal", "?"))})
@@ -276,6 +480,7 @@ def main():
         phases = state.get("phases") or []
         if phases and all(p.get("status") == "met" for p in phases):
             os.remove(state_path)
+            drop_pins(state)
             log("met", state, 0)
             out({"systemMessage":
                  f"✅ until: all {len(phases)} phases met — "
@@ -283,6 +488,7 @@ def main():
         # Either no check at all (v1 corrupt state) or every remaining phase
         # depends on an exhausted one: the loop cannot progress on its own.
         os.remove(state_path)
+        drop_pins(state)
         log("deadlock", state)
         out({"systemMessage":
              f"⏹ until: no runnable phase left — goal NOT met: "
@@ -290,10 +496,15 @@ def main():
 
     cwd = phase.get("cwd") or state.get("cwd")
     timeout = int(phase.get("check_timeout", state.get("check_timeout", 120)))
-    rc, tail = run_cmd(phase["check_cmd"], timeout, cwd)
+    integrity_error = integrity_check(state, phase, cwd)
+    if integrity_error:
+        rc, tail = 126, integrity_error
+    else:
+        rc, tail = run_cmd(phase["check_cmd"], timeout, cwd)
 
     # One free retry when the failure looks like a known flake.
-    if rc != 0 and not phase.get("flake_retry_used") and elapsed() < 60:
+    if (rc != 0 and not integrity_error and not phase.get("flake_retry_used")
+            and elapsed() < 60):
         if any(p.search(tail or "") for p in load_flake_patterns()):
             phase["flake_retry_used"] = True
             log("flake_retry", state, rc, {"phase": phase["id"]})
@@ -317,12 +528,32 @@ def main():
                  f"claims entry, then finish your turn again. Do not advance "
                  f"on an invalidated premise." + approvals_note(state)})
 
+        if not route_logged(state, phase):
+            nags = int(phase.get("route_log_nags", 0))
+            if nags < ROUTE_LOG_MAX_NAGS:
+                phase["route_log_nags"] = nags + 1
+                writeback_phase(state, phase)
+                save(state_path, state)
+                log("route_unlogged", state, rc, {"phase": phase["id"]})
+                out({"decision": "block", "reason":
+                     f"[/until — no try burned] Phase \"{phase.get('goal')}\" "
+                     f"check passed, but it was delegated (tier "
+                     f"{phase.get('tier')}) and routing-stats.jsonl has no "
+                     f"finish row for it. Run:\n  python3 ~/.claude/skills/"
+                     f"ticket-flow/log-route.py finish <route_id> --tokens N "
+                     f"--duration S --outcome \"...\"\n(start it first with "
+                     f"`log-route.py start --session {state.get('session_id')} "
+                     f"--phase {phase['id']} ...` if you never did), then "
+                     f"finish your turn." + approvals_note(state)})
+            log("route_unlogged_gave_up", state, rc, {"phase": phase["id"]})
+
         phase["status"] = "met"
         phase["met_at"] = time.time()
         writeback_phase(state, phase)
 
         if phase.get("_synthetic") or remaining_after == 0:
             os.remove(state_path)
+            drop_pins(state)
             log("met", state, rc, {"phase": phase["id"]})
             out({"systemMessage":
                  f"✅ until: goal met — {state.get('goal', '?')}"
@@ -351,6 +582,7 @@ def main():
 
     if tries_used >= max_tries:
         os.remove(state_path)
+        drop_pins(state)
         log("exhausted", state, rc, {"phase": phase["id"]})
         out({"systemMessage":
              f"⏹ until: try budget exhausted ({tries_used}/{max_tries}) on "

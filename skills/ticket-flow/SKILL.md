@@ -69,13 +69,23 @@ Routing rule (mechanical, no vibes):
 - Trivial phases (config bump, doc edit) you do yourself — delegation
   overhead would exceed the work.
 
-Record every routing decision durably: set the phase's `tier` field in
-the state file when you route it, and append one line to
-`~/.claude/until/routing-stats.jsonl` for EVERY routed phase (not only
-shadow samples) — `{ts, ticket, phase, tier, model, brief_lint: "pass|gap",
-tokens, duration_s, outcome}` using the numbers from the agent's task
-notification. The router can only become data-driven if the routine
-decisions are logged, not just the experiments.
+Record every routing decision with the helper — never hand-write rows
+(hand-written rows covered only 2 of the 6 tickets that dispatched agents; the rows that
+landed had stale "running" stubs and duplicate keys):
+
+```bash
+L=~/.claude/skills/ticket-flow/log-route.py
+$L start --session <SESSION_ID> --ticket 3146 --phase impl --model haiku --lint pass
+#  -> {"route_id": "ab12cd34ef", "shadow": true, "shadow_model": "opus"}
+$L finish ab12cd34ef --tokens 111754 --duration 600 --outcome "green first try"
+```
+
+`start` when you dispatch (verifiers too: `--kind verify --lint n/a`),
+`finish` from the agent's task notification. Every phase in the state file
+carries a `tier` field from arming time: `"self"` when you do it yourself,
+otherwise the model name. The gate refuses to complete a delegated phase
+until its `finish` row exists (no try burned, bounded nagging), so routing
+data cannot silently go missing. `$L summary` prints the calibration view.
 
 While an agent runs, do not duplicate its work; prepare the next phase's
 checks or clear approval-queue candidates.
@@ -144,25 +154,22 @@ removal) as approvals where they are destructive.
 
 ## Shadow sampling — calibrate the router with data
 
-For roughly **1 in 5 routine implementation phases** (deterministic rule:
-`ticket_number % 5 == 0`), also spawn a shadow agent of the OTHER tier with
-the identical brief, in an isolated worktree, with explicit instructions:
-**no PR, no push, no ticket/doc writes** — the shadow's diff dies with its
-worktree. When both finish, append one JSON line to
-`~/.claude/until/routing-stats.jsonl`:
+`log-route.py start` decides: when its output says `"shadow": true`, also
+spawn a shadow agent of `shadow_model` with the identical brief, in an
+isolated worktree, with explicit instructions: **no PR, no push, no
+ticket/doc writes** — the shadow's diff dies with its worktree. The rule is
+a hash of session:ticket:phase (1 in 5) plus a catch-up that forces a
+shadow after 4 unshadowed impl routes; the old `ticket % 5 == 0` rule
+sampled nothing across 3129/3134/3137/3074/3146. When both finish:
 
-```json
-{"ts": 0, "ticket": 3126, "phase": "impl", "primary": "opus",
- "shadow": "haiku", "primary_tokens": 0, "shadow_tokens": 0,
- "primary_s": 0, "shadow_s": 0,
- "diff_equivalent": true, "shadow_missed": "<what only primary caught>",
- "primary_missed": "<what only shadow caught>"}
+```bash
+$L shadow <route_id> --model opus --tokens N --duration S \
+   --diff-equivalent yes|no --shadow-missed "..." --primary-missed "..."
 ```
 
-(Token/duration numbers come from the agents' task notifications.) Skip
-sampling when the phase is credential-heavy, touches production, or the
-user asked for speed. Periodically (or when asked), summarize the stats
-file: if the cheap tier matches the expensive one on ≥90% of sampled
+Skip only when the phase is credential-heavy, touches production, or the
+user asked for speed — and log it (`$L skip-shadow <route_id> --reason
+"..."`), never skip silently. Periodically (or when asked), run `$L summary`: if the cheap tier matches the expensive one on ≥90% of sampled
 briefs that passed the 4-point lint, the lint is calibrated; where shadows
 diverge, tighten the lint with whatever the brief was missing.
 

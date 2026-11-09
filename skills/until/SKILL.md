@@ -185,7 +185,22 @@ credential provisioning, 4-eyes gates) go in `questions` with
 - `amend` — replace a check (`--phase <id>` targets a phase), appending
   `{"ts", "phase", "old_check", "new_check", "reason"}` to `amend_log`. The
   log is the audit trail of how the definition of done evolved; quote it in
-  the PR/ticket summary when relevant.
+  the PR/ticket summary when relevant. Editing a check **script** the
+  command runs is also an amend (old/new check may be equal; say what
+  changed in `reason`). If the amend replaces a live probe (curl, ssh, gh,
+  a test runner…) with a read of local files, ask the user first and only
+  after they explicitly agree add `"user_approved": true` to the entry.
+
+## Check integrity — the judge is pinned
+
+On a phase's first evaluation the gate pins its check command and the
+SHA-256 of every local script it executes (in `~/.claude/until/pins/`, so
+re-writing the state file does not reset it). Afterwards, a changed command
+or script without a newer `amend_log` entry for that phase fails the check
+(burns a try) with an `INTEGRITY` message, and so does an amend that turns
+a live probe into self-attestation without `user_approved`. Files a check
+merely reads (test files, JSON) are not pinned — but a check that only
+reads files you wrote proves nothing; prefer probing the real system.
 
 ## Flake patterns
 
