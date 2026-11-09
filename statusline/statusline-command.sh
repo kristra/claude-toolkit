@@ -45,6 +45,11 @@ if [ -n "$week" ]; then
   fi
 fi
 
+gw_part=$(bash ~/.claude/statusline-gateway.sh 2>/dev/null)
+if [ -n "$gw_part" ]; then
+  if [ -n "$rl_part" ]; then rl_part="${rl_part}  ${gw_part}"; else rl_part="$gw_part"; fi
+fi
+
 branch=""
 dirty=0
 if [ -n "$cwd" ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
