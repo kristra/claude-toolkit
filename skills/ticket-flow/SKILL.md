@@ -1,6 +1,6 @@
 ---
 name: ticket-flow
-description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "continue 2983", "work on ticket 2962" — and drives the orchestrated loop workflow (context pull, gap scan, phase-DAG done-contract, tiered agent routing, independent verification, /until goal loops, approval queue) so the user's role reduces to async approvals and scope decisions. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
+description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "continue 2983", "work on ticket 2962" — and drives the orchestrated loop workflow (context pull, triage verdict for bugs, gap scan, phase-DAG done-contract, tiered agent routing, independent verification, /until goal loops, approval queue) so the user's role reduces to async approvals and scope decisions. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
 ---
 
 # ticket-flow — orchestrated Fizzy ticket workflow
@@ -20,6 +20,62 @@ each phase transition in one line so the user can object.
    fetch new card comments, record any answers (`/until answer`), amend
    checks if needed, and resume the active phase. Skip the rest of Phase 0.
 
+## Phase 0.5 — triage: is this worth doing? (bugs: always)
+
+A card is a claim that something is wrong, not accepted work. "Fix bug
+NNNN" is not a triage verdict either — on 3155 the user said "fix", the
+flow jumped to *how* to fix it, and the user had to drag the real question
+("can we consider this a bug at all?") out over five rounds; the card
+closed as invalid. The deciding facts were all collectible up front.
+
+Collect, mostly in parallel and cheaply:
+1. **Provenance** — customer report (which org, which user, evidence
+   attached?), automated finding (Flow Atlas gap, Sentry, AI reviewer,
+   scanner), or internal observation. Automated findings prove a code path,
+   not that anyone walks it.
+2. **Real-world evidence** — prod data, logs, Sentry counts showing it
+   happens, how often, to whom. Every count carries a coverage check (see
+   Boundaries → absence claims).
+3. **Regression or day one?** — git history of the behaviour; a regression
+   points at a PR, an old behaviour points at an oversight or a decision.
+4. **Reachability** — which platforms, locales, roles, app versions can hit
+   it at all (e.g. iOS decimal pad shows only the region's separator).
+5. **Design intent** — was the current behaviour a decision (PR, ADR,
+   comment) or a default nobody chose?
+
+Plan every prod read this needs **up front** and ask for one explicit
+approval window for the batch — auto mode blocks prod reads, and three
+blocked-then-retoggled rounds (3155) cost more than the reads.
+
+Output a triage brief of at most 8 lines:
+
+> **Triage 3155 — verdict: park as invalid.**
+> Source: Flow Atlas gap #161 (code-path proof, no customer report).
+> Evidence: 0 misreads since the current input shipped (May 2025), 145k rows scanned.
+> Reach: id-region iPhones cannot type "."; Android habit slip only.
+> Day one, not a regression. Cheapest fix if wanted: ~10 lines, no UI.
+
+Verdicts: **fix as filed · smaller fix · downgrade · park/invalid · need
+reporter info**. Ask exactly ONE question — the verdict — with yours
+marked recommended. Only a fix verdict proceeds to Phase 1. Park/invalid
+drafts a card comment of at most 4 sentences (evidence + the fix on file if
+a client ever reports it), shown before posting.
+
+Log the outcome once the user decides (never hand-write the row):
+
+```bash
+~/.claude/skills/ticket-flow/log-triage.py --ticket 3155 \
+  --source automated --proposed park --decided park \
+  --deciding "no misreads since May 2025; id iPhones can't type '.'"
+```
+
+Skip triage only when the user's message already decides it (hotfix now,
+customer escalation they relay, "I already confirmed it, implement X") or
+for features with an explicit spec — then say `triage skipped: <reason>`
+in half a sentence. `log-triage.py summary` shows how often each source's
+cards are invalid and how often your verdict was overridden; use it to
+make triage cheaper where it is reliably right and stricter where not.
+
 ## Phase 1 — gap scan (before writing any code)
 
 List what the ticket under-specifies as concrete either/or questions.
@@ -28,6 +84,18 @@ Then split them:
 - **Reporter/product questions** → these go to the card via `/until ask`
   once the loop is armed (ask posts them as card comments).
 - If nothing is ambiguous, say so in half a sentence and move on.
+
+Fix-shape questions for client-facing apps: rank options by how much the
+user would notice — invisible fixes first. Clients "just want it to work";
+a new hint, dialog or warning for a rare edge case must justify itself
+(3155: an inline "Saved as 1 KG" hint was rejected as TMI). When the triage
+evidence is weak, "leave as is" is always one of the options.
+
+**One recommendation at a time.** Keep a single current recommendation
+across the whole ticket. When new evidence changes it, say so explicitly —
+"Changed: hint → park, because …" — never let it drift silently. On 3155
+it moved reject → hint → park → "invisible fix if any" and the user had to
+ask "what was your recommended fix?".
 
 ## Phase 2 — compile the done-contract as a phase DAG, then arm ONCE
 
@@ -176,6 +244,13 @@ diverge, tighten the lint with whatever the brief was missing.
   queue, never retried and never handed to another agent (that is
   permission laundering).
 - One armed state file at a time; the DAG replaces sequential re-arming.
+- Absence claims need coverage: "zero hits", "never happens", "no one
+  uses it" from a data scan may only be stated together with the scan's
+  coverage — rows scanned vs the collection's total, and the missing or
+  malformed rate of every field you filtered on. On 3155 a `submittedAt`
+  filter silently dropped ~97% of rows (the field is often absent or a
+  string) and "0 misreads in 24 months" was reported as fact, then
+  reversed. A suspiciously small denominator is a bug in the query.
 - Claims discipline: when you catch yourself writing "evidently",
   "presumably", or "should already" about something gating a decision —
   that is an inference; measure it or ledger it as one.
