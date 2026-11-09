@@ -1,6 +1,6 @@
 ---
 name: fizzy
-description: View and manage Fizzy boards, cards, and comments via the Fizzy REST API directly (curl), with pagination handled correctly.
+description: View and manage Fizzy boards, cards, and comments via the Fizzy REST API directly (curl), with pagination handled correctly. When the user starts or resumes WORK on a ticket ("let's work on 3074", "continue 2983"), use ticket-flow instead — it loads this skill itself.
 ---
 
 # Fizzy (direct REST API)

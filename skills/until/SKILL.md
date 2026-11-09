@@ -36,6 +36,8 @@ evidence) for criteria that are objectively checkable.
 /until claim "<statement>" --verify "<cmd>"  # record a load-bearing claim with its re-check
 /until amend --check "<new command>" --reason "<why>"   # single-goal mode
 /until amend --phase <id> --check "<new>" --reason "<why>"
+/until wait <id> "<what>" [--max S]          # a background agent owns the work
+/until waited <id>                           # that agent finished
 ```
 
 ## What to do on invocation
@@ -68,6 +70,7 @@ evidence) for criteria that are objectively checkable.
      "cwd": "<absolute cwd the check should run in>",
      "fizzy_card": <card number or null>,
      "questions": [],
+     "waiting_on": [],
      "claims": [],
      "amend_log": []
    }
@@ -182,6 +185,12 @@ credential provisioning, 4-eyes gates) go in `questions` with
 - `claim "<statement>" --verify "<cmd>"` — append to `claims` (status
   "verified", `verified_at` = now if you just ran the command; otherwise 0
   so the gate verifies it first).
+- `wait <id> "<what>" [--max S]` — append `{"id", "what", "since": <now>,
+  "max_wait_s": S (default 7200)}` to `waiting_on`. While any wait lacks
+  `done_at`, stops are allowed without running the check or burning a try;
+  past `max_wait_s` the gate blocks (twice at most) so you check on the
+  agent. Use it whenever you end a turn with a background agent working.
+- `waited <id>` — set `done_at` on that entry; the next stop runs the check.
 - `amend` — replace a check (`--phase <id>` targets a phase), appending
   `{"ts", "phase", "old_check", "new_check", "reason"}` to `amend_log`. The
   log is the audit trail of how the definition of done evolved; quote it in

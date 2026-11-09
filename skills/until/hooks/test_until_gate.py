@@ -281,5 +281,49 @@ check("routing rows parse, no running stubs",
       all(r.get("event") in ("start", "finish") for r in rows)
       and rows[-1]["event"] == "finish" and rows[-1]["model"] == "opus")
 
+# 14. waiting_on: a running background agent lets the stop through, free
+NOW = time.time()
+write({**base, "goal": "waits", "check_cmd": "false", "max_tries": 3,
+       "tries_used": 0, "waiting_on": [{"id": "impl", "what": "haiku impl agent",
+                                        "since": NOW, "max_wait_s": 3600}]})
+r = gate()
+check("wait allows stop", "waiting on 1 agent" in r.get("systemMessage", ""))
+check("wait burns no try, skips check", read()["tries_used"] == 0)
+r = gate()
+check("repeat wait notice is silent", r == {})
+
+# 14b. an overdue wait blocks (bounded) so the model checks the agent
+s = read()
+s["waiting_on"][0]["since"] = NOW - 7200
+write(s)
+r = gate()
+check("overdue wait blocks", r.get("decision") == "block"
+      and "Still waiting" in r.get("reason", ""))
+gate()
+r = gate()
+check("overdue nag bounded", "past its limit" in r.get("systemMessage", ""))
+check("overdue burns no try", read()["tries_used"] == 0)
+
+# 14c. a finished wait (done_at) hands control back to the check
+s = read()
+s["waiting_on"][0]["done_at"] = NOW
+write(s)
+r = gate()
+check("done wait runs the check", r.get("decision") == "block"
+      and "try 1/3" in r.get("reason", ""))
+
+# 15. park notice is shown once per change, not on every stop
+write({**base, "goal": "park", "check_cmd": "false", "max_tries": 3,
+       "tries_used": 0, "questions": [{"id": 1, "q": "which way?", "answer": None}]})
+r1 = gate()
+r2 = gate()
+check("first park notice shown", "until parked" in r1.get("systemMessage", ""))
+check("repeat park notice silent", r2 == {})
+s = read()
+s["questions"].append({"id": 2, "q": "and this?", "answer": None})
+write(s)
+r3 = gate()
+check("new question re-notifies", "2 open decision" in r3.get("systemMessage", ""))
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
