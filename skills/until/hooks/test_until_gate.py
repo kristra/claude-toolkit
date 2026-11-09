@@ -3,7 +3,9 @@
 
 Covers: v1 single-goal compatibility, DAG advance (free transition), try
 accounting, same-error hint, all-met completion, flake retry, claim-ledger
-blocking, approval queue vs parking questions, and budget exhaustion.
+blocking, approval queue vs parking questions, budget exhaustion, check
+integrity pins (tamper, amend re-pin, re-arm, live->local downgrade), route
+logging enforcement, and log-route.py shadow sampling.
 Uses a temp dir via UNTIL_STATE_DIR; touches nothing in ~/.claude.
 """
 import json
@@ -17,7 +19,9 @@ TMP = tempfile.mkdtemp(prefix="until-test-")
 STATE_DIR = os.path.join(TMP, "state")
 os.makedirs(STATE_DIR)
 GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "until-gate.py")
-ENV = dict(os.environ, UNTIL_STATE_DIR=STATE_DIR)
+ROUTING = os.path.join(TMP, "routing-stats.jsonl")
+ENV = dict(os.environ, UNTIL_STATE_DIR=STATE_DIR, UNTIL_ROUTING_PATH=ROUTING)
+PINS = os.path.join(TMP, "pins", "sess1.json")
 SP = os.path.join(STATE_DIR, "sess1.json")
 
 
@@ -27,7 +31,10 @@ def gate():
     return json.loads(p.stdout) if p.stdout.strip() else {}
 
 
-def write(state):
+def write(state, keep_pins=False):
+    """Fresh scenario by default; keep_pins simulates a re-arm mid-loop."""
+    if not keep_pins and os.path.exists(PINS):
+        os.remove(PINS)
     with open(SP, "w") as f:
         json.dump(state, f)
 
@@ -45,7 +52,8 @@ def check(name, cond):
     ok, fail = ok + cond, fail + (not cond)
 
 
-base = {"goal": "test goal", "created_at": time.time(), "cwd": TMP,
+base = {"goal": "test goal", "session_id": "sess1",
+        "created_at": time.time(), "cwd": TMP,
         "questions": [], "claims": [], "amend_log": []}
 
 # 1. v1 single goal: failing check blocks and burns a try
@@ -160,6 +168,118 @@ write({**base, "check_cmd": "false", "max_tries": 1, "tries_used": 0})
 r = gate()
 check("exhaustion allows stop", "budget exhausted" in r.get("systemMessage", ""))
 check("exhaustion cleans up", read() is None)
+
+# 11. integrity: a check script edited after pinning fails without an amend
+script = os.path.join(TMP, "check.sh")
+with open(script, "w") as f:
+    f.write("#!/bin/zsh\nexit 1\n")
+os.chmod(script, 0o755)
+write({**base, "goal": "integrity", "check_cmd": script, "max_tries": 5,
+       "tries_used": 0})
+gate()  # first sight: pins command + script hash, check fails normally
+check("pins file written", os.path.exists(PINS))
+with open(script, "w") as f:
+    f.write("#!/bin/zsh\nexit 0\n")  # model rewrites its own judge
+r = gate()
+check("edited script blocked", r.get("decision") == "block"
+      and "INTEGRITY" in r.get("reason", ""))
+check("tamper burns a try", read()["tries_used"] == 2)
+
+# 11b. the same edit recorded in amend_log is accepted and re-pinned
+s = read()
+s["amend_log"] = [{"ts": time.time() + 1, "phase": None, "old_check": script,
+                   "new_check": script, "reason": "script had a bug"}]
+write(s, keep_pins=True)
+r = gate()
+check("amended script accepted", "goal met" in r.get("systemMessage", ""))
+check("pins dropped when loop ends", not os.path.exists(PINS))
+
+# 11c. a re-arm (fresh state file) cannot reset the pin of a running loop
+write({**base, "goal": "rearm", "phases": [
+    {"id": "bench", "goal": "device answers", "check_cmd": "curl -sf http://127.0.0.1:9/ || false",
+     "max_tries": 5, "tries_used": 0, "status": "pending", "needs": []}]})
+gate()
+evidence = os.path.join(TMP, "bench.json")
+with open(evidence, "w") as f:
+    f.write("{}")
+write({**base, "goal": "rearm", "created_at": time.time(), "phases": [
+    {"id": "bench", "goal": "device answers", "check_cmd": f"cat {evidence}",
+     "max_tries": 5, "tries_used": 0, "status": "pending", "needs": []}]},
+      keep_pins=True)
+r = gate()
+check("re-armed check change blocked", "INTEGRITY" in r.get("reason", ""))
+
+# 11d. amending a live probe into a local read needs user_approved
+s = read()
+s["amend_log"] = [{"ts": time.time() + 1, "phase": "bench",
+                   "old_check": "curl ...", "new_check": f"cat {evidence}",
+                   "reason": "device offline"}]
+write(s, keep_pins=True)
+r = gate()
+check("live->local downgrade blocked", "self-attestation" in r.get("reason", ""))
+s = read()
+s["amend_log"][0]["user_approved"] = True
+write(s, keep_pins=True)
+r = gate()
+check("approved downgrade accepted", "goal met" in r.get("systemMessage", ""))
+
+# 12. route logging: a delegated phase cannot complete unlogged
+def routed_state():
+    return {**base, "goal": "routed", "phases": [
+        {"id": "impl", "goal": "impl green", "check_cmd": "true", "tier": "haiku",
+         "max_tries": 5, "tries_used": 0, "status": "pending", "needs": []},
+        {"id": "ci", "goal": "ci green", "check_cmd": "false",
+         "max_tries": 5, "tries_used": 0, "status": "pending", "needs": ["impl"]}]}
+write(routed_state())
+r = gate()
+check("unlogged route blocks", r.get("decision") == "block"
+      and "routing-stats" in r.get("reason", ""))
+check("unlogged route burns no try", read()["phases"][0]["tries_used"] == 0)
+with open(ROUTING, "a") as f:
+    f.write(json.dumps({"event": "finish", "session": "sess1",
+                        "phase": "impl", "outcome": "ok"}) + "\n")
+r = gate()
+check("logged route advances", "phase met" in r.get("reason", ""))
+
+# 12b. nagging is bounded: after the cap the phase completes anyway
+os.remove(ROUTING)
+write(routed_state())
+gate(); gate()
+r = gate()
+check("route nag bounded", "phase met" in r.get("reason", ""))
+
+# 12c. phases the orchestrator did itself never need a route row
+st = routed_state()
+st["phases"][0]["tier"] = "self"
+write(st)
+r = gate()
+check("self tier needs no route", "phase met" in r.get("reason", ""))
+os.remove(SP)
+
+# 13. log-route.py: well-formed rows, shadow catch-up, finish satisfies gate
+LR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "ticket-flow", "log-route.py")
+open(ROUTING, "w").close()
+
+
+def lr(*args):
+    p = subprocess.run(["python3", LR, *args], capture_output=True, text=True, env=ENV)
+    return json.loads(p.stdout) if p.stdout.strip().startswith("{") else p
+
+
+shadows = [lr("start", "--session", "s9", "--ticket", str(t), "--phase", "impl",
+              "--model", "haiku", "--lint", "pass")["shadow"]
+           for t in range(3000, 3010)]
+check("shadow sampled at least 1 in 5", sum(shadows) >= 2)
+check("never 5 unshadowed in a row",
+      all(any(shadows[i:i + 5]) for i in range(len(shadows) - 4)))
+rid = lr("start", "--session", "s9", "--ticket", "1", "--phase", "x",
+         "--model", "opus", "--lint", "gap", "--kind", "verify")["route_id"]
+lr("finish", rid, "--tokens", "10", "--duration", "5", "--outcome", "ok")
+rows = [json.loads(l) for l in open(ROUTING)]
+check("routing rows parse, no running stubs",
+      all(r.get("event") in ("start", "finish") for r in rows)
+      and rows[-1]["event"] == "finish" and rows[-1]["model"] == "opus")
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
