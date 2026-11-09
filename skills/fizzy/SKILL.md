@@ -21,6 +21,23 @@ never silently hidden.
 When the user asks about their Fizzy board(s), cards, bugs/enhancements
 backlog, or asks to create/update a card or comment on Fizzy.
 
+## Session continuity reminder
+
+The first time a specific card/ticket becomes the focus of debugging or
+work in a session (not just a passing lookup), prompt the user to name the
+session after it, wrapped in the standard input-needed banner:
+
+```
+━━━ NEEDS YOUR INPUT ━━━
+Working on ticket <card_number>: run `/rename ticket-<card_number>` so you
+can resume this exact conversation later with `/resume ticket-<card_number>`.
+━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Only prompt once per ticket per session (don't repeat it on every message).
+This is a nudge, not a blocker — continue the actual work regardless of
+whether the user acts on it.
+
 ## Auth & accounts
 
 Token lives in `$FIZZY_ACCESS_TOKEN`, account slug in `$FIZZY_ACCOUNT_SLUG`
