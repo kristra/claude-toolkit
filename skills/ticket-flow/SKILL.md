@@ -1,6 +1,6 @@
 ---
 name: ticket-flow
-description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "continue 2983", "work on ticket 2962" — and drives the orchestrated loop workflow (context pull, triage verdict for bugs, gap scan, phase-DAG done-contract, tiered agent routing, independent verification, /until goal loops, approval queue) so the user's role reduces to async approvals and scope decisions. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
+description: Fires automatically, without being asked, whenever the user starts or resumes work on a Fizzy ticket — "let's work on fizzy 1234", "let's work on 3074" (a bare number counts), "continue 2983", "fix fizzy bug 3155" — and also mid-session, the moment work the user resumed ("continue the labelling tool") turns out to belong to a Fizzy ticket. Takes precedence over the plain fizzy skill for ticket work, and drives the orchestrated loop workflow (context pull, triage verdict for bugs, gap scan, phase-DAG done-contract, tiered agent routing, independent verification, /until goal loops, approval queue) so the user's role reduces to async approvals and scope decisions. Does NOT fire for merely viewing/discussing a ticket, board queries, or non-ticket work.
 ---
 
 # ticket-flow — orchestrated Fizzy ticket workflow
@@ -156,7 +156,12 @@ until its `finish` row exists (no try burned, bounded nagging), so routing
 data cannot silently go missing. `$L summary` prints the calibration view.
 
 While an agent runs, do not duplicate its work; prepare the next phase's
-checks or clear approval-queue candidates.
+checks or clear approval-queue candidates. Before ending a turn with a
+background agent still owning the phase, record it as a wait —
+`/until wait <id> "<model> <phase> agent <task id>"` — and mark it done
+(`/until waited <id>`) when its task notification arrives. Never fake this
+with an "INTERNAL WAIT" question: questions are for humans, they park the
+loop under the wrong label, and they risk being posted to the card.
 
 ## Phase 4 — independent verification (after every implementation phase)
 

@@ -32,6 +32,13 @@ Extras, all deterministic:
     fails the check unless an amend_log entry for that phase is newer than
     the pin; an amend that drops every live probe (curl, ssh, gh, test
     runners...) for a local file read additionally needs "user_approved".
+  - waiting_on: entries {"id", "what", "since", "max_wait_s"} without
+    "done_at" mean a background agent owns the work. The stop is allowed
+    without running the check or burning a try; past max_wait_s (default 2h)
+    the gate blocks (bounded) so the model checks on the agent. Replaces the
+    "INTERNAL WAIT" questions orchestrators used to fake this with.
+  - parked/waiting notices are shown only when the set of open items
+    changes, not on every stop (3134 repeated one notice 14 times).
   - route logging: a phase with a delegated "tier" cannot complete until
     routing-stats.jsonl holds a "finish" row for it (written by
     ticket-flow/log-route.py), so routing data cannot silently go missing.
@@ -67,6 +74,8 @@ CLAIM_TIMEOUT_DEFAULT = 30
 TOTAL_BUDGET_SECONDS = 150        # stay under the Stop-hook timeout
 SELF_TIERS = (None, "", "self", "none")   # phases the orchestrator did itself
 ROUTE_LOG_MAX_NAGS = 2            # then let the phase complete, logged
+WAIT_DEFAULT_SECONDS = 2 * 3600   # background agent presumed stuck after this
+WAIT_OVERDUE_MAX_NAGS = 2
 # A check containing none of these only inspects local state the model can
 # write itself (a file it produced, a script it can edit).
 LIVE_PROBE_RE = re.compile(
@@ -422,6 +431,13 @@ def route_logged(state, phase):
     return False
 
 
+def notice_sig(kind, items, state):
+    """Identity of what a parked/waiting notice would say, for de-duping."""
+    pending = sorted(str(q.get("id")) for q in (state.get("questions") or [])
+                     if not q.get("answer") and q.get("type") == "approval")
+    return [kind, sorted(str(i.get("id")) for i in items), pending]
+
+
 def save(state_path, state):
     with open(state_path, "w") as f:
         json.dump(state, f)
@@ -469,11 +485,55 @@ def main():
     if open_blocking:
         # Blocked on decisions, not on work: allow the stop cleanly,
         # burn no tries, keep the state parked until answers land.
-        log("parked", state)
+        sig = notice_sig("park", open_blocking, state)
+        repeat = state.get("notice_sig") == sig
+        log("parked", state, extra={"repeat": True} if repeat else None)
+        if repeat:
+            out({})
+        state["notice_sig"] = sig
+        save(state_path, state)
         heads = "; ".join(q.get("q", "?")[:90] for q in open_blocking[:3])
         out({"systemMessage":
              f"❓ until parked — {len(open_blocking)} open decision(s) on "
              f"\"{state.get('goal', '?')}\": {heads}" + approvals_note(state)})
+
+    waits = [w for w in (state.get("waiting_on") or []) if not w.get("done_at")]
+    if waits:
+        now = time.time()
+        overdue = [w for w in waits if now - float(w.get("since") or now)
+                   > float(w.get("max_wait_s") or WAIT_DEFAULT_SECONDS)]
+        if overdue:
+            w = overdue[0]
+            nags = int(w.get("overdue_nags", 0))
+            mins = int((now - float(w.get("since") or now)) // 60)
+            log("wait_overdue", state, extra={"wait": w.get("id"), "nag": nags})
+            if nags < WAIT_OVERDUE_MAX_NAGS:
+                w["overdue_nags"] = nags + 1
+                save(state_path, state)
+                out({"decision": "block", "reason":
+                     f"[/until — no try burned] Still waiting on "
+                     f"\"{w.get('what', w.get('id'))}\" after {mins} min "
+                     f"(limit {int(float(w.get('max_wait_s') or WAIT_DEFAULT_SECONDS) // 60)}"
+                     f" min). Check on it now (task output / notification). "
+                     f"If it finished, set done_at on waiting_on[{w.get('id')}] "
+                     f"and continue; if it is legitimately still running, "
+                     f"raise max_wait_s; if it is stuck, stop it and re-route "
+                     f"the phase." + approvals_note(state)})
+            out({"systemMessage":
+                 f"⚠️ until: waiting on \"{w.get('what', w.get('id'))}\" for "
+                 f"{mins} min, past its limit — check the agent."
+                 + approvals_note(state)})
+        sig = notice_sig("wait", waits, state)
+        repeat = state.get("notice_sig") == sig
+        log("waiting", state, extra={"waits": [w.get("id") for w in waits],
+                                     **({"repeat": True} if repeat else {})})
+        if repeat:
+            out({})
+        state["notice_sig"] = sig
+        save(state_path, state)
+        what = "; ".join(str(w.get("what", w.get("id")))[:80] for w in waits[:3])
+        out({"systemMessage": f"⏳ until waiting on {len(waits)} agent(s): "
+                              f"{what}" + approvals_note(state)})
 
     phase, remaining_after = active_phase(state)
     if phase is None:
