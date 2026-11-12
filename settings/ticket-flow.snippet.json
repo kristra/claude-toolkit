@@ -1,5 +1,5 @@
 {
-  "_comment": "Merge into ~/.claude/settings.json — the ticket-flow trigger nudge (hooks.UserPromptSubmit). It only adds one line of context when a prompt starts/resumes work on a 4-5 digit Fizzy ticket; it never blocks. Assumes the skill is installed at ~/.claude/skills/ticket-flow.",
+  "_comment": "Merge into ~/.claude/settings.json. UserPromptSubmit: the ticket-flow trigger nudge — one line of context when a prompt starts/resumes a 4-5 digit Fizzy ticket, and adoption of a released /until loop for that ticket. PostToolUse(Bash): pr-arm — one line of context when `gh pr create` succeeds and no armed phase checks that PR. Neither ever blocks. Assumes the skill is installed at ~/.claude/skills/ticket-flow.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,6 +7,18 @@
           {
             "type": "command",
             "command": "/Users/nimbly/.claude/skills/ticket-flow/hooks/ticket-nudge.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/nimbly/.claude/skills/ticket-flow/hooks/pr-arm-nudge.py",
             "timeout": 10
           }
         ]

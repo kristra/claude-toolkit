@@ -17,6 +17,9 @@ active check every time you try to end your turn:
   output back as feedback; keep working, then end your turn to re-check
 - after a phase's `max_tries` blocked stops the loop gives up and lets you
   stop, telling the user the goal was NOT met
+- check exits **126/127** (not executable / command not found) → the check
+  is **broken**, not failed: no try burned, you are asked to fix the check
+  (at most 3 times; then the loop is kept but not evaluated)
 
 The evaluator is deterministic — no LLM judges the condition. That is the
 point: this complements the built-in `/goal` (LLM evaluator, conversation-only
@@ -36,8 +39,10 @@ evidence) for criteria that are objectively checkable.
 /until claim "<statement>" --verify "<cmd>"  # record a load-bearing claim with its re-check
 /until amend --check "<new command>" --reason "<why>"   # single-goal mode
 /until amend --phase <id> --check "<new>" --reason "<why>"
-/until wait <id> "<what>" [--max S]          # a background agent owns the work
-/until waited <id>                           # that agent finished
+/until wait <id> "<what>" [--max S] [--expect S] [--probe "<cmd>"]
+                                             # an agent, a process or the human owns the next step
+/until waited <id>                           # that wait is over
+/until handoff "<note path>"                 # release the loop to a fresh session
 ```
 
 ## What to do on invocation
@@ -190,7 +195,15 @@ credential provisioning, 4-eyes gates) go in `questions` with
   `done_at`, stops are allowed without running the check or burning a try;
   past `max_wait_s` the gate blocks (twice at most) so you check on the
   agent. Use it whenever you end a turn with a background agent working.
+  `--expect S` records how long you expect to idle (`"expect_s"`);
+  `--probe "<cmd>"` (`"probe_cmd"`, read-only, exits 0 when the awaited
+  thing is true) lets the gate end the wait by itself — see "Waiting on the
+  human's hands" below.
 - `waited <id>` — set `done_at` on that entry; the next stop runs the check.
+- `handoff "<note path>"` — after writing the handoff note, set
+  `"handoff": {"at": <epoch>, "note": "<path>"}` in the state file (Edit
+  tool). The loop is then released: stops pass, nothing is checked, the
+  lease is 7 days. See "Context budget and handoff".
 - `amend` — replace a check (`--phase <id>` targets a phase), appending
   `{"ts", "phase", "old_check", "new_check", "reason"}` to `amend_log`. The
   log is the audit trail of how the definition of done evolved; quote it in
@@ -199,6 +212,59 @@ credential provisioning, 4-eyes gates) go in `questions` with
   changed in `reason`). If the amend replaces a live probe (curl, ssh, gh,
   a test runner…) with a read of local files, ask the user first and only
   after they explicitly agree add `"user_approved": true` to the entry.
+
+## Context budget and handoff
+
+Every turn re-reads the whole conversation, so a session's cost per turn is
+its context size; any pause longer than the prompt cache's lifetime (5 min by
+default) re-writes all of it. The gate reads the context size from the
+transcript on every stop and enforces a budget:
+
+- **Phase boundary over 150k** → the advance message tells you not to work
+  the next phase in this context.
+- **Over 200k anywhere** (then once per further 100k) → said once, appended
+  to the next block message; in a session with no loop armed it is a
+  one-time block of its own.
+- **A wait with `expect_s` over the cache lifetime, over 150k** → asked once
+  to hand off before idling.
+
+What to do when told:
+1. Write the **handoff** into the ticket memory file (no ticket: tell the
+   user the same in at most 8 lines, no new file). It holds only what the
+   next context needs: the current decision/recommendation, the facts
+   established with the command that verifies each, open approvals and
+   questions, the exact next step with its check, and paths to evidence.
+   If the next context would have to ask you something, the note failed.
+2. Then get a fresh context, in this order of preference:
+   - **subagent**: run the next phase in an Agent with a brief built from
+     the note — nothing is needed from the user;
+   - **fresh session**: `/until handoff "<note path>"`, then one line to the
+     user: handoff written, continue with "continue <ticket>" after `/clear`.
+     The ticket-nudge hook moves the state file (and pins) to whichever
+     session next names that ticket, so the loop survives the switch. Needs
+     `fizzy_card` set; loops without a ticket use the subagent route.
+3. If the user keeps working in this session anyway, remove `"handoff"` from
+   the state so the gate evaluates again.
+
+Do not argue with the number or defer the note: writing it costs one turn,
+carrying 300k of stale context costs every turn after.
+
+## Waiting on the human's hands
+
+When the next step is physical or on the user's side (plug in a device,
+reflash, `aws login`, approve in a browser), do not ask them to type "done":
+
+1. Say once, in one line, what you need them to do.
+2. Start a background probe that exits when it is true — Bash with
+   `run_in_background`, e.g.
+   `until ls /dev/cu.usbmodem* >/dev/null 2>&1; do sleep 3; done` or
+   `until aws sts get-caller-identity >/dev/null 2>&1; do sleep 10; done`.
+   The harness re-invokes you when it exits, so the work resumes by itself.
+3. Register it: `/until wait <id> "<what>" --probe "<same test, one shot>"
+   --expect <seconds>`. The gate ends the wait when the probe passes.
+
+Use this only where a command can really observe the event; a judgment
+("is the room quiet enough?") is still a question for the user.
 
 ## Check integrity — the judge is pinned
 

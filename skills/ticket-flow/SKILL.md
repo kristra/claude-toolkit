@@ -19,6 +19,11 @@ each phase transition in one line so the user can object.
 3. If `/until status` shows a parked or in-flight loop for this ticket:
    fetch new card comments, record any answers (`/until answer`), amend
    checks if needed, and resume the active phase. Skip the rest of Phase 0.
+4. If the hook context says a loop was **adopted** from an earlier session:
+   read the handoff note it names first and continue from its "next step".
+   Do not re-pull the card, re-read files or re-derive facts the note
+   records, and do not re-arm. Open with one line: where things stand and
+   what you are doing next — the user must not have to ask "where were we?".
 
 ## Phase 0.5 — triage: is this worth doing? (bugs: always)
 
@@ -116,6 +121,28 @@ ask "what was your recommended fix?".
 4. Show the DAG in a few lines; unless the user objects, arm the loop
    (`fizzy_card` set). Try budgets: 3 while requirements are shaky, 5 for
    implementation phases, 8–10 for CI/deploy babysit phases.
+5. **PRs arm themselves.** Any PR this work opens gets a `pr-ci` phase
+   (`gh pr checks <n> --repo <org>/<repo>`, tries 8) whether or not the DAG
+   planned one; the pr-arm hook reminds you the moment `gh pr create`
+   succeeds. Babysit to green and read the AI-review comments without being
+   asked — "babysit the PR" and "have you checked the AI reviews?" are
+   prompts the user should never need.
+
+### Investigation tickets get a contract too
+
+"Investigation" changes what the checks look like, not whether there is a
+loop. Arm one with deliverable-shaped checks: the report is deployed (`curl
+-fsS <url>`), the card carries the TL;DR comment, the numbers file exists
+with N rows. On 3229 the flow said "investigation, so no loop" and the
+ticket then ran two and a half days — bench, firmware, a PR — with nothing
+armed and the user babysitting by hand.
+
+**Re-entry.** The moment the scope changes — the user says implement /
+build / ship, a repo gets a branch, or a PR is about to exist — stop and run
+Phase 2 for the new scope: show the DAG in a few lines and arm it (amend the
+running loop if one exists). Say `scope changed: investigation →
+implementation` in one line. Never carry an "investigation, no loop"
+decision past the point where code is being written.
 
 ## Phase 3 — route the work (tiered execution)
 
@@ -136,6 +163,18 @@ Routing rule (mechanical, no vibes):
   report them as claims with verify commands."
 - Trivial phases (config bump, doc edit) you do yourself — delegation
   overhead would exceed the work.
+
+**Delegation is the default, and it is what keeps this thread cheap.** Your
+context should hold briefs, summaries, decisions and the user's words — not
+tool output. In the week this rule was written, 97% of tokens were spent in
+main threads running at 300–600k context and subagents did 3% of the work.
+Besides implementation phases, always hand these to a subagent:
+- **Report, doc and artifact writing** → `model: "sonnet"`, briefed with the
+  numbers and the audience. Wording feedback from the user goes back to that
+  agent (SendMessage), not into this thread.
+- **Log-, bench- and data-heavy probing** (long command output, transcripts,
+  screenshots, scans) → an agent that returns the numbers and the paths.
+- **Broad code reading** → Explore.
 
 Record every routing decision with the helper — never hand-write rows
 (hand-written rows covered only 2 of the 6 tickets that dispatched agents; the rows that
@@ -191,6 +230,23 @@ The gate advances the DAG automatically; your job per stop:
   `/until ask --approval --command "..."` and continue whatever is not
   blocked. Production deploys are NEVER yours to trigger.
 
+**Waits on the user's hands** (plug in, reflash, log in, approve in a
+browser): say what you need once, then follow "Waiting on the human's hands"
+in the until skill — a background probe resumes the work when it happens.
+"done", "plugged in" and "aws login done" are prompts to design away.
+
+**Credentials: ask where, never hunt.** When you lack a credential or do not
+know where one lives, do not grep `.env` files, home directories or the
+keychain for it — the classifier denies that as credential exploration (6 of
+the 10 denials in one week) and it burns turns. Check memory for a
+reference; if there is none, queue one approval asking where it lives, and
+once the user answers save the location (never the secret) as a `reference`
+memory so it is asked exactly once.
+
+**End every turn that is not a close-out with a status line:** `Next: <what
+you do next> · Blocked on: <nothing | the one thing>`. "What's your next
+task?" and "is the setup ready?" are prompts the user should never need.
+
 **Pre-approved — never ask, never park for these:** committing and pushing
 a non-default fix/feature branch (signed per repo convention), opening or
 updating the PR, and re-running flaky CI. These are reversible. The consent
@@ -225,6 +281,23 @@ Also: update the ticket memory file (status, PRs, amend_log summary if
 status on the card. Queue cleanup commands (branch deletion, worktree
 removal) as approvals where they are destructive.
 
+## Context budget — when a phase boundary is forced
+
+The until gate measures this session's context on every stop and tells you
+when to cut (until skill → "Context budget and handoff"). Three triggers,
+whichever comes first:
+1. **The deliverable changes** — investigation → implementation → PR →
+   staging → report. Each is its own phase and, by default, its own agent.
+2. **Size** — over 150k at a phase boundary, over 200k anywhere.
+3. **Expected idle** — a soak, an overnight run, "tonight at 7 when the
+   office is empty": register it as a wait with `--expect`; the cache will
+   be cold when the work resumes, so resume in a small context.
+
+At every boundary, update the ticket memory file *before* moving on — status
+at close-out only is too late. Prefer the subagent route (nothing needed
+from the user); use `/until handoff` when the main thread itself is the
+problem.
+
 ## Shadow sampling — calibrate the router with data
 
 `log-route.py start` decides: when its output says `"shadow": true`, also
@@ -248,8 +321,10 @@ diverge, tighten the lint with whatever the brief was missing.
 
 ## Boundaries
 
-- Investigation-only requests ("why does X happen?") get the
-  investigate-bug treatment, not loops — report findings, don't arm.
+- A one-off question ("why does X happen?") gets the investigate-bug
+  treatment — report findings, don't arm. An investigation *ticket* is
+  different: it gets a contract (see Phase 2) and re-entry when the scope
+  turns into implementation.
 - Approvals, 4-eyes gates, destructive migrations, production deploys:
   never inside a check, never executed by you or an agent on your behalf —
   approval queue only. A permission-classifier denial is routed to the

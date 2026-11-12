@@ -43,6 +43,24 @@ Extras, all deterministic:
     routing-stats.jsonl holds a "finish" row for it (written by
     ticket-flow/log-route.py), so routing data cannot silently go missing.
 
+  - broken checks: exit 126/127 (not executable / command not found) means
+    the judge could not run. No try is burned; the gate asks for the check
+    to be fixed, at most 3 times, then keeps the loop un-evaluated.
+  - context budget: the gate reads the session's context size from the
+    transcript (hook input "transcript_path"). At a phase boundary over the
+    soft limit (150k) it requires a handoff note and a fresh context
+    (subagent, or release the loop); over the hard limit (200k, then every
+    further 100k) it says so once, also in sessions with no loop armed.
+    UNTIL_CTX_SOFT / UNTIL_CTX_HARD / UNTIL_CTX_STEP override;
+    UNTIL_CTX_DISABLE=1 turns it off.
+  - handoff: a state with "handoff" set is released — stops pass, nothing is
+    checked, lease 7 days — until a fresh session adopts it (ticket-nudge
+    moves the state file when the user says "continue <ticket>").
+  - wait probes and idle: a waiting_on entry may carry "probe_cmd" (the
+    wait ends when it exits 0) and "expect_s"; idling longer than the
+    prompt-cache lifetime (UNTIL_CACHE_TTL_S, default 300) over the soft
+    context limit asks for a handoff first, once per wait.
+
 State files live in ~/.claude/until/state/<session_id>.json (_fallback.json
 when the in-session skill could not determine its session id). Set
 UNTIL_STATE_DIR to override the directory (used by tests).
@@ -76,6 +94,25 @@ SELF_TIERS = (None, "", "self", "none")   # phases the orchestrator did itself
 ROUTE_LOG_MAX_NAGS = 2            # then let the phase complete, logged
 WAIT_DEFAULT_SECONDS = 2 * 3600   # background agent presumed stuck after this
 WAIT_OVERDUE_MAX_NAGS = 2
+# Context budget. Every turn re-reads the whole conversation, so a session's
+# cost per turn is its context size. Soft = cut at the next phase boundary;
+# hard = cut now; past hard, one more notice per further step.
+CTX_SOFT = int(os.environ.get("UNTIL_CTX_SOFT", 150_000))
+CTX_HARD = int(os.environ.get("UNTIL_CTX_HARD", 200_000))
+CTX_STEP = int(os.environ.get("UNTIL_CTX_STEP", 100_000))
+CTX_DISABLED = os.environ.get("UNTIL_CTX_DISABLE") == "1"
+CTX_DIR = os.path.join(os.path.dirname(STATE_DIR), "ctx")
+CTX_TAIL_BYTES = 4_000_000
+# Prompt-cache lifetime: idling longer than this re-writes the whole context.
+CACHE_TTL_SECONDS = int(os.environ.get("UNTIL_CACHE_TTL_S", 300))
+# Exit codes that mean the check itself could not run (not executable /
+# command not found). They say nothing about the goal, so they burn no try.
+BROKEN_CHECK_RCS = (126, 127)
+BROKEN_CHECK_MAX_NAGS = 3
+HANDOFF_FIELDS = ("the current decision/recommendation, the facts established "
+                  "(each with the command that verifies it), open approvals "
+                  "and questions, the exact next step with its check, and "
+                  "paths to evidence")
 # A check containing none of these only inspects local state the model can
 # write itself (a file it produced, a script it can edit).
 LIVE_PROBE_RE = re.compile(
@@ -124,6 +161,133 @@ def run_cmd(cmd, timeout, cwd):
         return 125, f"(command failed to run: {e})"
 
 
+def context_tokens(transcript_path):
+    """Context size of the main thread's latest turn, from the transcript.
+
+    Reads only the file's tail. Returns None when it cannot tell (no path,
+    unreadable, no usage row in the tail) — callers then skip budget logic.
+    """
+    if not transcript_path or CTX_DISABLED:
+        return None
+    try:
+        with open(os.path.expanduser(transcript_path), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - CTX_TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    for line in reversed(lines):
+        if '"usage"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        msg = row.get("message") or {}
+        usage = msg.get("usage")
+        if (row.get("type") != "assistant" or row.get("isSidechain")
+                or not isinstance(usage, dict)
+                or msg.get("model") == "<synthetic>"):
+            continue
+        return sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens"))
+    return None
+
+
+def ctx_level(tokens):
+    """0 under soft, 1 between soft and hard, 2+ at/over hard (per step)."""
+    if tokens is None or tokens < CTX_SOFT:
+        return 0
+    if tokens < CTX_HARD:
+        return 1
+    return 2 + (tokens - CTX_HARD) // max(CTX_STEP, 1)
+
+
+def _ctx_marker(session_id):
+    return os.path.join(CTX_DIR, f"{session_id or '_nosession'}.json")
+
+
+def ctx_hard_due(session_id, tokens):
+    """True once per hard level. Re-arms when context shrinks (compaction)."""
+    level = ctx_level(tokens)
+    try:
+        with open(_ctx_marker(session_id)) as f:
+            seen = int(json.load(f).get("level", 0))
+    except Exception:
+        seen = 0
+    if level < seen or (level >= 2 and level > seen):
+        try:
+            os.makedirs(CTX_DIR, exist_ok=True)
+            with open(_ctx_marker(session_id), "w") as f:
+                json.dump({"level": level, "tokens": tokens,
+                           "ts": time.time()}, f)
+        except Exception:
+            pass
+    return level >= 2 and level > seen
+
+
+def ctx_block_note(state, tokens, boundary):
+    """Text appended to a block message when the context budget is spent.
+
+    boundary=True is a phase transition: the cheapest place to cut, so the
+    soft limit applies there. Elsewhere only the hard limit speaks, once per
+    level.
+    """
+    if tokens is None:
+        return ""
+    k = tokens // 1000
+    release = ("set \"handoff\": {\"at\": <epoch>, \"note\": \"<path>\"} in "
+               "the state file and tell the user in ONE line to continue in "
+               "a fresh session (`/clear`, then \"continue <ticket>\" — the "
+               "loop is adopted there automatically)")
+    if boundary and tokens >= CTX_SOFT:
+        ctx_hard_due(state.get("session_id"), tokens)  # count it as shown
+        log("ctx_boundary", state, extra={"tokens": tokens})
+        return (f"\n\n📦 Context is {k}k tokens (budget {CTX_SOFT // 1000}k) and "
+                f"this is a phase boundary. Do NOT work the next phase in "
+                f"this context. First write the handoff to the ticket memory "
+                f"file: {HANDOFF_FIELDS}. Then either run the next phase in a "
+                f"subagent (Agent tool: its tool output stays out of this "
+                f"context), or {release}.")
+    if ctx_hard_due(state.get("session_id"), tokens):
+        log("ctx_hard", state, extra={"tokens": tokens})
+        return (f"\n\n📦 Context is {k}k tokens, over the hard budget "
+                f"({CTX_HARD // 1000}k): every further turn re-reads all of "
+                f"it. Write the handoff to the ticket memory file now "
+                f"({HANDOFF_FIELDS}); then push the remaining work of this "
+                f"phase into a subagent, or {release}.")
+    return ""
+
+
+def budget_only(hook_input, session_id):
+    """No loop armed: still enforce the hard context budget, once per level."""
+    if hook_input.get("stop_hook_active"):
+        return
+    tokens = context_tokens(hook_input.get("transcript_path"))
+    if tokens is None or not ctx_hard_due(session_id, tokens):
+        return
+    log("ctx_hard", {"session_id": session_id}, extra={"tokens": tokens,
+                                                       "armed": False})
+    out({"decision": "block", "reason":
+         f"[context budget — shown once at this level] This session's context "
+         f"is {tokens // 1000}k tokens (hard budget {CTX_HARD // 1000}k). "
+         f"Every further turn re-reads all of it, and any pause over "
+         f"{CACHE_TTL_SECONDS // 60} min re-writes all of it.\n"
+         f"If the work is finished or within a few turns of finished, just "
+         f"say so and stop. Otherwise:\n"
+         f"1. Ticket work: update the ticket memory file with "
+         f"{HANDOFF_FIELDS}. Non-ticket work: give the user the same state "
+         f"in at most 8 lines (no new file).\n"
+         f"2. End the turn with ONE line: where the handoff is, and that "
+         f"continuing in a fresh session (`/clear`, then \"continue "
+         f"<ticket>\" or the 8 lines pasted back) is the cheap way on.\n"
+         f"3. Anything multi-step that must still happen in this session "
+         f"goes to a subagent (Agent tool), so its tool output stays out of "
+         f"this context."})
+
+
 def load_flake_patterns():
     try:
         with open(FLAKE_PATTERNS_PATH) as f:
@@ -161,6 +325,8 @@ def active_phase(state):
             "flake_retry_used": state.get("flake_retry_used"),
             "status": "active", "_synthetic": True,
         }
+        if state.get("broken_nags"):
+            synth["broken_nags"] = state["broken_nags"]
         return synth, 0
     met = {p["id"] for p in phases if p.get("status") == "met"}
     runnable = [
@@ -185,6 +351,10 @@ def writeback_phase(state, phase):
                          ("flake_retry_used", "flake_retry_used")):
             if src in phase:
                 state[dst] = phase[src]
+        if "broken_nags" in phase:
+            state["broken_nags"] = phase["broken_nags"]
+        else:
+            state.pop("broken_nags", None)
 
 
 def normalize_claims(state):
@@ -415,6 +585,8 @@ def route_logged(state, phase):
     """True when a delegated phase has its routing 'finish' row recorded."""
     if phase.get("tier") in SELF_TIERS:
         return True
+    # a loop adopted by a fresh session keeps its earlier sessions' rows
+    sessions = [state.get("session_id")] + list(state.get("prev_sessions") or [])
     try:
         with open(ROUTING_PATH) as f:
             for line in f:
@@ -423,7 +595,7 @@ def route_logged(state, phase):
                 except Exception:
                     continue
                 if (row.get("event") == "finish"
-                        and row.get("session") == state.get("session_id")
+                        and row.get("session") in sessions
                         and row.get("phase") == phase["id"]):
                     return True
     except Exception:
@@ -456,6 +628,7 @@ def main():
     candidates.append(os.path.join(STATE_DIR, "_fallback.json"))
     state_path = next((p for p in candidates if os.path.isfile(p)), None)
     if not state_path:
+        budget_only(hook_input, session_id)
         sys.exit(0)
 
     try:
@@ -474,13 +647,33 @@ def main():
         and (q.get("type") != "approval" or q.get("blocking"))
     ]
 
+    tokens = context_tokens(hook_input.get("transcript_path"))
+    handed_off = bool(state.get("handoff"))
+
     age = time.time() - float(state.get("created_at", 0))
-    if age > (PARKED_MAX_AGE_SECONDS if open_blocking else MAX_AGE_SECONDS):
+    if age > (PARKED_MAX_AGE_SECONDS if (open_blocking or handed_off)
+              else MAX_AGE_SECONDS):
         os.remove(state_path)
         drop_pins(state)
         log("expired", state)
         out({"systemMessage": "until: stale goal state discarded: "
                               + str(state.get("goal", "?"))})
+
+    if handed_off:
+        # Released for a fresh session to adopt (ticket-nudge does that on
+        # "continue <ticket>"): no check, no tries, 7-day lease.
+        sig = ["handoff"]
+        repeat = state.get("notice_sig") == sig
+        log("handed_off", state, extra={"repeat": True} if repeat else None)
+        if repeat:
+            out({})
+        state["notice_sig"] = sig
+        save(state_path, state)
+        out({"systemMessage":
+             f"📦 until: loop handed off — \"{state.get('goal', '?')}\". A "
+             f"fresh session adopts it on \"continue <ticket>\"; to keep "
+             f"working here instead, say so and the handoff flag is dropped."
+             + approvals_note(state)})
 
     if open_blocking:
         # Blocked on decisions, not on work: allow the stop cleanly,
@@ -498,6 +691,20 @@ def main():
              f"\"{state.get('goal', '?')}\": {heads}" + approvals_note(state)})
 
     waits = [w for w in (state.get("waiting_on") or []) if not w.get("done_at")]
+    # A wait may carry a probe (device present, login valid, file exists):
+    # when it passes, the wait is over without anyone typing "done".
+    probed = False
+    for w in waits:
+        if w.get("probe_cmd") and elapsed() < 60:
+            prc, _ = run_cmd(w["probe_cmd"], int(w.get("probe_timeout", 15)),
+                             state.get("cwd"))
+            if prc == 0:
+                w["done_at"], w["done_by"] = time.time(), "probe"
+                probed = True
+                log("wait_probe_passed", state, extra={"wait": w.get("id")})
+    if probed:
+        save(state_path, state)
+        waits = [w for w in waits if not w.get("done_at")]
     if waits:
         now = time.time()
         overdue = [w for w in waits if now - float(w.get("since") or now)
@@ -523,6 +730,32 @@ def main():
                  f"⚠️ until: waiting on \"{w.get('what', w.get('id'))}\" for "
                  f"{mins} min, past its limit — check the agent."
                  + approvals_note(state)})
+        # About to idle past the cache lifetime with a big context: the next
+        # turn would re-write all of it. Cut here instead (once per wait).
+        long_waits = [w for w in waits
+                      if float(w.get("expect_s") or 0) > CACHE_TTL_SECONDS
+                      and not w.get("idle_nagged")]
+        if long_waits and tokens is not None and tokens >= CTX_SOFT:
+            for w in long_waits:
+                w["idle_nagged"] = True
+            save(state_path, state)
+            w = long_waits[0]
+            log("idle_handoff", state, extra={"wait": w.get("id"),
+                                              "tokens": tokens})
+            out({"decision": "block", "reason":
+                 f"[/until — no try burned] You are about to idle about "
+                 f"{int(float(w.get('expect_s')) // 60)} min on "
+                 f"\"{w.get('what', w.get('id'))}\" holding {tokens // 1000}k "
+                 f"tokens of context. The prompt cache expires after "
+                 f"{CACHE_TTL_SECONDS // 60} min, so the next turn would "
+                 f"re-write all of it. Write the handoff to the ticket memory "
+                 f"file now: {HANDOFF_FIELDS}. If whatever ends this wait "
+                 f"reports back only into THIS session (a background task or "
+                 f"agent), keep the session and just finish the turn. "
+                 f"Otherwise set \"handoff\": {{\"at\": <epoch>, \"note\": "
+                 f"\"<path>\"}} in the state file and tell the user in ONE "
+                 f"line to come back with \"continue <ticket>\" in a fresh "
+                 f"session." + approvals_note(state)})
         sig = notice_sig("wait", waits, state)
         repeat = state.get("notice_sig") == sig
         log("waiting", state, extra={"waits": [w.get("id") for w in waits],
@@ -569,6 +802,34 @@ def main():
             phase["flake_retry_used"] = True
             log("flake_retry", state, rc, {"phase": phase["id"]})
             rc, tail = run_cmd(phase["check_cmd"], timeout, cwd)
+
+    # The check itself could not run: that is a broken judge, not a failed
+    # goal (3185 burned 5 tries in 31 s on "command not found").
+    if not integrity_error and rc in BROKEN_CHECK_RCS:
+        nags = int(phase.get("broken_nags", 0))
+        phase["broken_nags"] = nags + 1
+        writeback_phase(state, phase)
+        save(state_path, state)
+        log("check_broken", state, rc, {"phase": phase["id"], "nag": nags})
+        if nags < BROKEN_CHECK_MAX_NAGS:
+            out({"decision": "block", "reason":
+                 f"[/until — no try burned] The CHECK for phase "
+                 f"\"{phase.get('goal')}\" is broken: it exited {rc} "
+                 f"({'command not found' if rc == 127 else 'not executable'})"
+                 f", which says nothing about the goal.\n"
+                 f"Check command: {phase['check_cmd']}\n"
+                 f"Run from: {cwd or '(hook cwd)'} under /bin/zsh -c, without "
+                 f"your interactive shell's PATH additions.\n"
+                 f"Output tail:\n{tail or '(no output)'}\n\n"
+                 f"Fix the check (absolute paths, the right cwd, an installed "
+                 f"binary) and record it with `/until amend`. Do not touch "
+                 f"the work itself for this." + approvals_note(state)})
+        out({"systemMessage":
+             f"⚠️ until: the check for phase \"{phase.get('goal')}\" is still "
+             f"broken (exit {rc}) after {BROKEN_CHECK_MAX_NAGS} notices — the "
+             f"loop is kept but NOT being evaluated. Fix the check command."
+             + approvals_note(state)})
+    phase.pop("broken_nags", None)
 
     if rc == 0:
         failing_claim = recheck_claims(state, cwd)
@@ -630,6 +891,7 @@ def main():
              f"Its check (exit 0 = done): {nxt.get('check_cmd') if nxt else '?'}\n\n"
              f"Announce the transition to the user in one line, then work the "
              f"next phase and finish your turn to re-check."
+             + ctx_block_note(state, tokens, boundary=True)
              + approvals_note(state)})
 
     # Failure path.
@@ -671,7 +933,9 @@ def main():
         f"check. If you are only waiting on something external, wait briefly "
         f"or run the relevant probe yourself before finishing the turn. If the "
         f"goal has become impossible or the user has asked to stop, delete "
-        f"{state_path} and explain why." + approvals_note(state)
+        f"{state_path} and explain why."
+        + ctx_block_note(state, tokens, boundary=False)
+        + approvals_note(state)
     )
     out({"decision": "block", "reason": reason})
 
