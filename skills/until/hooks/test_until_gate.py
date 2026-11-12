@@ -325,5 +325,159 @@ write(s)
 r3 = gate()
 check("new question re-notifies", "2 open decision" in r3.get("systemMessage", ""))
 
+
+# ---- 16+. broken checks, context budget, handoff, wait probes, idle ----
+TP = os.path.join(TMP, "transcript.jsonl")
+
+
+def transcript(tokens):
+    """A transcript whose latest MAIN-thread turn has `tokens` of context."""
+    rows = [
+        {"type": "assistant", "message": {"model": "m", "usage": {
+            "input_tokens": 5, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 999_999}}},          # older turn
+        {"type": "assistant", "message": {"model": "m", "usage": {
+            "input_tokens": 10, "cache_creation_input_tokens": 990,
+            "cache_read_input_tokens": tokens - 1000}}},     # latest main turn
+        {"type": "assistant", "isSidechain": True, "message": {
+            "model": "m", "usage": {"input_tokens": 7}}},    # subagent: ignored
+        {"type": "user", "message": {"content": "x"}},
+    ]
+    with open(TP, "w") as f:
+        f.write("\n".join(json.dumps(r) for r in rows) + "\n")
+    return TP
+
+
+def gate2(tokens=None, sid="sess1", env=None, **extra):
+    payload = {"session_id": sid, **extra}
+    if tokens is not None:
+        payload["transcript_path"] = transcript(tokens)
+    p = subprocess.run(["python3", GATE], input=json.dumps(payload),
+                       capture_output=True, text=True, env=env or ENV)
+    return json.loads(p.stdout) if p.stdout.strip() else {}
+
+
+# 16. a check that cannot run (exit 127) burns no try and is bounded
+write({**base, "goal": "broken", "check_cmd": "definitely-not-a-command-xyz",
+       "max_tries": 3, "tries_used": 0})
+r = gate()
+check("broken check blocks", r.get("decision") == "block"
+      and "is broken" in r.get("reason", ""))
+check("broken check burns no try", read()["tries_used"] == 0)
+gate()
+gate()
+r = gate()
+check("broken check nag bounded", "still broken" in r.get("systemMessage", ""))
+check("broken check keeps the loop", read() is not None
+      and read()["tries_used"] == 0)
+s = read()
+s["check_cmd"] = "true"
+s["amend_log"] = [{"ts": time.time() + 1, "old_check": "x", "new_check": "true",
+                   "reason": "fixed the binary name"}]
+write(s, keep_pins=True)
+r = gate()
+check("fixed check completes", "goal met" in r.get("systemMessage", ""))
+
+# 16b. a broken check inside a DAG phase behaves the same
+write({**base, "goal": "broken dag", "phases": [
+    {"id": "a", "goal": "phase A", "check_cmd": "/nonexistent/dir/probe.sh",
+     "max_tries": 2, "tries_used": 0, "status": "pending", "needs": []}]})
+r = gate()
+check("broken DAG check burns no try", r.get("decision") == "block"
+      and read()["phases"][0]["tries_used"] == 0
+      and read()["phases"][0]["broken_nags"] == 1)
+
+# 17. context budget with NO loop armed: silent under hard, once per level
+if os.path.exists(SP):
+    os.remove(SP)
+check("no loop, under hard: silent", gate2(180_000, sid="ctx1") == {})
+r = gate2(210_000, sid="ctx1")
+check("no loop, over hard: blocks once", r.get("decision") == "block"
+      and "context budget" in r.get("reason", "") and "210k" in r["reason"])
+check("no loop, same level: silent", gate2(215_000, sid="ctx1") == {})
+check("no loop, next step: blocks again",
+      gate2(320_000, sid="ctx1").get("decision") == "block")
+check("no loop, shrunk (compacted): silent", gate2(60_000, sid="ctx1") == {})
+check("no loop, regrown: blocks again",
+      gate2(205_000, sid="ctx1").get("decision") == "block")
+check("stop_hook_active: never blocks",
+      gate2(400_000, sid="ctx2", stop_hook_active=True) == {})
+check("budget can be disabled",
+      gate2(400_000, sid="ctx3", env=dict(ENV, UNTIL_CTX_DISABLE="1")) == {})
+check("no transcript: silent", gate2(sid="ctx4") == {})
+
+# 18. context budget at a phase boundary (soft limit)
+dag = {**base, "goal": "ctx dag", "phases": [
+    {"id": "a", "goal": "phase A", "check_cmd": "true",
+     "max_tries": 3, "tries_used": 0, "status": "pending", "needs": []},
+    {"id": "b", "goal": "phase B", "check_cmd": "false",
+     "max_tries": 3, "tries_used": 0, "status": "pending", "needs": ["a"]}]}
+write(json.loads(json.dumps(dag)))
+r = gate2(160_000)
+check("boundary over soft asks for handoff", r.get("decision") == "block"
+      and "phase boundary" in r.get("reason", "") and "handoff" in r["reason"])
+write(json.loads(json.dumps(dag)))
+r = gate2(100_000)
+check("boundary under soft: plain advance", r.get("decision") == "block"
+      and "phase boundary" not in r.get("reason", ""))
+
+# 18b. hard limit rides on a failure message once
+write({**base, "goal": "ctx fail", "session_id": "hard1", "check_cmd": "false",
+       "max_tries": 5, "tries_used": 0})
+os.replace(SP, os.path.join(STATE_DIR, "hard1.json"))
+r = gate2(230_000, sid="hard1")
+check("hard limit noted on failure", "over the hard budget" in r.get("reason", ""))
+r = gate2(232_000, sid="hard1")
+check("hard limit noted once", r.get("decision") == "block"
+      and "over the hard budget" not in r.get("reason", ""))
+os.remove(os.path.join(STATE_DIR, "hard1.json"))
+
+# 19. a handed-off loop is released: no check, no tries, one notice
+write({**base, "goal": "handed", "check_cmd": "false", "max_tries": 3,
+       "tries_used": 0, "fizzy_card": 3229,
+       "handoff": {"at": NOW, "note": "/tmp/ticket_3229.md"}})
+r1 = gate()
+r2 = gate()
+check("handoff notice shown", "handed off" in r1.get("systemMessage", ""))
+check("handoff repeat silent", r2 == {})
+check("handoff burns no try", read()["tries_used"] == 0)
+
+# 20. wait probe: a passing probe ends the wait and the check runs
+write({**base, "goal": "probe", "check_cmd": "false", "max_tries": 3,
+       "tries_used": 0, "waiting_on": [
+           {"id": 1, "what": "usb device", "since": NOW, "probe_cmd": "true"}]})
+r = gate()
+check("passing probe ends the wait", r.get("decision") == "block"
+      and "try 1/3" in r.get("reason", "")
+      and read()["waiting_on"][0].get("done_by") == "probe")
+write({**base, "goal": "probe2", "check_cmd": "false", "max_tries": 3,
+       "tries_used": 0, "waiting_on": [
+           {"id": 1, "what": "usb device", "since": NOW, "probe_cmd": "false"}]})
+r = gate()
+check("failing probe keeps waiting", "until waiting" in r.get("systemMessage", "")
+      and read()["tries_used"] == 0)
+
+# 21. idling past the cache lifetime with a big context asks for a handoff
+idle = {**base, "goal": "idle", "check_cmd": "false", "max_tries": 3,
+        "tries_used": 0, "waiting_on": [
+            {"id": 1, "what": "overnight soak", "since": NOW, "expect_s": 3600}]}
+write(json.loads(json.dumps(idle)))
+r = gate2(170_000)
+check("long idle at big context blocks", r.get("decision") == "block"
+      and "about to idle" in r.get("reason", ""))
+r = gate2(170_000)
+check("idle handoff asked once", "until waiting" in r.get("systemMessage", ""))
+check("idle handoff burns no try", read()["tries_used"] == 0)
+write(json.loads(json.dumps(idle)))
+r = gate2(90_000)
+check("long idle at small context: plain wait",
+      "until waiting" in r.get("systemMessage", ""))
+short = json.loads(json.dumps(idle))
+short["waiting_on"][0]["expect_s"] = 120
+write(short)
+r = gate2(170_000)
+check("short idle at big context: plain wait",
+      "until waiting" in r.get("systemMessage", ""))
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
