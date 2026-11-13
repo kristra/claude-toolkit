@@ -20,7 +20,7 @@
 # box shows a dim suggestion), so it sends Ctrl-U before each line: a draft
 # the user was typing in that tab is dropped, not submitted.
 # Exit: 0 typed (or dry-run found it), 2 bad usage / session not found,
-# 3 session busy.
+# 3 session busy, 4 the tab is not running claude.
 SESSION=${ITERM_SESSION_ID:-}; DELAY=2; GAP=3; WAIT=0; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +54,9 @@ on run argv
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s) is sid then
+            if act is "cmd" then
+              tell s to return (variable named "commandLine")
+            end if
             if act is "tail" then
               set c to contents of s
               if length of c > 1500 then set c to text -1500 thru -1 of c
@@ -76,6 +79,17 @@ on run argv
 end run
 OSA
 }
+
+# Only ever type into a running Claude Code: if the user quit it, the text
+# would land in their shell.
+CMDLINE=$(iterm cmd) || { echo "iTerm AppleScript failed" >&2; exit 2; }
+case "$CMDLINE" in
+  *__NOT_FOUND__*) echo "session not found: $SESSION" >&2; exit 2 ;;
+esac
+case "$(basename -- "${CMDLINE%% *}")" in
+  claude) ;;
+  *) echo "foreground job is not claude ($CMDLINE); not typing" >&2; exit 4 ;;
+esac
 
 WAITED=0
 while :; do
