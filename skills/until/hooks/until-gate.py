@@ -106,6 +106,12 @@ CTX_DIR = os.path.join(os.path.dirname(STATE_DIR), "ctx")
 CTX_TAIL_BYTES = 4_000_000
 # Prompt-cache lifetime: idling longer than this re-writes the whole context.
 CACHE_TTL_SECONDS = int(os.environ.get("UNTIL_CACHE_TTL_S", 3600))
+# Opt-in: type "/clear" + "continue <ticket>" into this terminal once a loop is
+# handed off, so the user does not have to (iTerm only; see auto-clear.sh).
+AUTO_CLEAR = os.environ.get("UNTIL_AUTO_CLEAR") == "1"
+AUTO_CLEAR_CMD = os.environ.get("UNTIL_AUTO_CLEAR_CMD") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "auto-clear.sh")
+AUTO_CLEAR_NOTE_MAX_AGE = 1800  # the handoff note must be this fresh (s)
 # Exit codes that mean the check itself could not run (not executable /
 # command not found). They say nothing about the goal, so they burn no try.
 BROKEN_CHECK_RCS = (126, 127)
@@ -604,6 +610,60 @@ def route_logged(state, phase):
     return False
 
 
+def auto_clear(state):
+    """Start the detached typer for a handed-off loop. Returns (fired, why).
+
+    Fires at most once per handoff, and only when a fresh session can pick
+    everything up: the loop names a ticket (adoption keys on it), the handoff
+    note exists and was written recently, and no open wait depends on a
+    notification into this session (a wait without a probe_cmd).
+    """
+    handoff = state.get("handoff")
+    if not AUTO_CLEAR or not isinstance(handoff, dict):
+        return False, None
+    if handoff.get("auto_clear_at") or handoff.get("auto_clear_skipped"):
+        return False, None
+    term = os.environ.get("ITERM_SESSION_ID")
+    card = state.get("fizzy_card")
+    note = handoff.get("note")
+    why = None
+    if not term:
+        why = "not in iTerm"
+    elif not card:
+        why = "the loop has no fizzy_card to continue by"
+    elif not note or not os.path.isfile(os.path.expanduser(str(note))):
+        why = "the handoff note file does not exist"
+    elif time.time() - os.path.getmtime(os.path.expanduser(str(note))) \
+            > AUTO_CLEAR_NOTE_MAX_AGE:
+        why = "the handoff note was not updated recently"
+    else:
+        unprobed = [w for w in (state.get("waiting_on") or [])
+                    if not w.get("done_at") and not w.get("probe_cmd")]
+        if unprobed:
+            why = ("open wait \"%s\" has no probe_cmd, so only this session "
+                   "would hear it finish" % unprobed[0].get("what", "?"))
+    if why:
+        handoff["auto_clear_skipped"] = why
+        log("auto_clear_skipped", state, extra={"why": why})
+        return False, why
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        errlog = open(os.path.join(os.path.dirname(LOG_PATH),
+                                   "auto-clear.log"), "a")
+        subprocess.Popen(
+            [AUTO_CLEAR_CMD, "--session", term, "--delay", "3", "--wait", "30",
+             f"continue {card}"],
+            stdin=subprocess.DEVNULL, stdout=errlog, stderr=errlog,
+            start_new_session=True)
+    except Exception as e:
+        handoff["auto_clear_skipped"] = f"launch failed: {e}"
+        log("auto_clear_skipped", state, extra={"why": str(e)})
+        return False, str(e)
+    handoff["auto_clear_at"] = time.time()
+    log("auto_clear", state, extra={"card": card})
+    return True, None
+
+
 def notice_sig(kind, items, state):
     """Identity of what a parked/waiting notice would say, for de-duping."""
     pending = sorted(str(q.get("id")) for q in (state.get("questions") or [])
@@ -669,11 +729,18 @@ def main():
         if repeat:
             out({})
         state["notice_sig"] = sig
+        fired, why = auto_clear(state)
         save(state_path, state)
+        if fired:
+            out({"systemMessage":
+                 f"📦 until: loop handed off — clearing this session and "
+                 f"continuing #{state.get('fizzy_card')} in a fresh one "
+                 f"(auto-clear, a few seconds)." + approvals_note(state)})
         out({"systemMessage":
              f"📦 until: loop handed off — \"{state.get('goal', '?')}\". A "
              f"fresh session adopts it on \"continue <ticket>\"; to keep "
              f"working here instead, say so and the handoff flag is dropped."
+             + (f" (auto-clear skipped: {why})" if why else "")
              + approvals_note(state)})
 
     if open_blocking:
