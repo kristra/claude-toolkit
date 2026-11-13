@@ -243,6 +243,16 @@ What to do when told:
      The ticket-nudge hook moves the state file (and pins) to whichever
      session next names that ticket, so the loop survives the switch. Needs
      `fizzy_card` set; loops without a ticket use the subagent route.
+   With `UNTIL_AUTO_CLEAR=1` (opt-in, iTerm only) the gate then types
+   `/clear` and `continue <ticket>` into this terminal itself, a few seconds
+   after the turn ends, and the fresh session adopts the loop. It does so
+   only when the loop has a `fizzy_card`, the note file exists and was
+   written in the last 30 min, and every open wait carries a `probe_cmd`
+   (a wait without one is only heard in this session). So before a handoff:
+   write the note, and give each open wait a probe or close it. Never set
+   the handoff flag while a background task or agent of this session still
+   has to report back. If the gate says "auto-clear skipped", tell the user
+   the one-line `/clear` instruction as before.
 3. If the user keeps working in this session anyway, remove `"handoff"` from
    the state so the gate evaluates again.
 

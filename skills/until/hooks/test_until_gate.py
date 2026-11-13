@@ -20,7 +20,8 @@ STATE_DIR = os.path.join(TMP, "state")
 os.makedirs(STATE_DIR)
 GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "until-gate.py")
 ROUTING = os.path.join(TMP, "routing-stats.jsonl")
-ENV = dict(os.environ, UNTIL_STATE_DIR=STATE_DIR, UNTIL_ROUTING_PATH=ROUTING)
+ENV = dict(os.environ, UNTIL_STATE_DIR=STATE_DIR, UNTIL_ROUTING_PATH=ROUTING,
+           UNTIL_AUTO_CLEAR="0")  # never type into the real terminal
 PINS = os.path.join(TMP, "pins", "sess1.json")
 SP = os.path.join(STATE_DIR, "sess1.json")
 
@@ -478,6 +479,93 @@ write(short)
 r = gate2(170_000)
 check("short idle at big context: plain wait",
       "until waiting" in r.get("systemMessage", ""))
+
+# ---- 22+. auto-clear: opt-in typer launched once for a handed-off loop ----
+STUB = os.path.join(TMP, "typer.sh")
+STUB_OUT = os.path.join(TMP, "typer.out")
+with open(STUB, "w") as f:
+    f.write(f'#!/bin/sh\necho "$@" >> {STUB_OUT}\n')
+os.chmod(STUB, 0o755)
+NOTE = os.path.join(TMP, "ticket_3229.md")
+AC_ENV = dict(ENV, UNTIL_AUTO_CLEAR="1", UNTIL_AUTO_CLEAR_CMD=STUB,
+              ITERM_SESSION_ID="w0t0p0:TEST-ID")
+
+
+def ac_gate(env=AC_ENV):
+    p = subprocess.run(["python3", GATE], input=json.dumps({"session_id": "sess1"}),
+                       capture_output=True, text=True, env=env)
+    return json.loads(p.stdout) if p.stdout.strip() else {}
+
+
+def typed():
+    for _ in range(20):
+        if os.path.exists(STUB_OUT):
+            return open(STUB_OUT).read()
+        time.sleep(0.1)
+    return ""
+
+
+def ac_state(**over):
+    open(NOTE, "w").write("handoff")
+    if os.path.exists(STUB_OUT):
+        os.remove(STUB_OUT)
+    st = {**base, "goal": "handed", "check_cmd": "false", "max_tries": 3,
+          "tries_used": 0, "fizzy_card": 3229,
+          "handoff": {"at": time.time(), "note": NOTE}}
+    st.update(over)
+    write(st)
+
+
+ac_state()
+r1 = ac_gate()
+out1 = typed()
+r2 = ac_gate()
+check("auto-clear fires on handoff", "auto-clear" in r1.get("systemMessage", "")
+      and "skipped" not in r1["systemMessage"])
+check("auto-clear typer gets session + prompt",
+      "--session w0t0p0:TEST-ID" in out1 and "continue 3229" in out1)
+check("auto-clear fires once", r2 == {} and typed().count("continue") == 1
+      and bool(read()["handoff"].get("auto_clear_at")))
+
+ac_state()
+r = ac_gate(env=dict(AC_ENV, UNTIL_AUTO_CLEAR="0"))
+check("auto-clear is opt-in", "auto-clear" not in r.get("systemMessage", "")
+      and typed() == "")
+
+ac_state()
+os.utime(NOTE, (time.time() - 7200, time.time() - 7200))
+r = ac_gate()
+check("auto-clear skips a stale note", "skipped" in r.get("systemMessage", "")
+      and typed() == "")
+
+ac_state(handoff={"at": time.time(), "note": os.path.join(TMP, "missing.md")})
+r = ac_gate()
+check("auto-clear skips a missing note", "skipped" in r.get("systemMessage", "")
+      and typed() == "")
+
+ac_state(waiting_on=[{"id": 1, "what": "bg agent", "since": time.time()}])
+r = ac_gate()
+check("auto-clear skips an unprobed open wait",
+      "no probe_cmd" in r.get("systemMessage", "") and typed() == "")
+
+ac_state(waiting_on=[{"id": 1, "what": "soak", "since": time.time(),
+                      "probe_cmd": "false"},
+                     {"id": 2, "what": "old", "since": 1, "done_at": 2}])
+r = ac_gate()
+check("auto-clear fires with only probed waits open",
+      "skipped" not in r.get("systemMessage", "") and "continue 3229" in typed())
+
+ac_state(fizzy_card=None)
+r = ac_gate()
+check("auto-clear needs a ticket", "skipped" in r.get("systemMessage", "")
+      and typed() == "")
+
+env_noterm = {k: v for k, v in AC_ENV.items() if k != "ITERM_SESSION_ID"}
+ac_state()
+r = ac_gate(env=env_noterm)
+check("auto-clear needs iTerm", "not in iTerm" in r.get("systemMessage", "")
+      and typed() == "")
+os.remove(SP)
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
