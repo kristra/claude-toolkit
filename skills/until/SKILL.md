@@ -216,8 +216,8 @@ credential provisioning, 4-eyes gates) go in `questions` with
 ## Context budget and handoff
 
 Every turn re-reads the whole conversation, so a session's cost per turn is
-its context size; any pause longer than the prompt cache's lifetime (5 min by
-default) re-writes all of it. The gate reads the context size from the
+its context size; any pause longer than the prompt cache's lifetime (1 hour by
+default, `UNTIL_CACHE_TTL_S`) re-writes all of it. The gate reads the context size from the
 transcript on every stop and enforces a budget:
 
 - **Phase boundary over 150k** → the advance message tells you not to work

@@ -58,7 +58,8 @@ Extras, all deterministic:
     moves the state file when the user says "continue <ticket>").
   - wait probes and idle: a waiting_on entry may carry "probe_cmd" (the
     wait ends when it exits 0) and "expect_s"; idling longer than the
-    prompt-cache lifetime (UNTIL_CACHE_TTL_S, default 300) over the soft
+    prompt-cache lifetime (UNTIL_CACHE_TTL_S, default 3600:
+    sessions run with the 1-hour cache) over the soft
     context limit asks for a handoff first, once per wait.
 
 State files live in ~/.claude/until/state/<session_id>.json (_fallback.json
@@ -104,7 +105,7 @@ CTX_DISABLED = os.environ.get("UNTIL_CTX_DISABLE") == "1"
 CTX_DIR = os.path.join(os.path.dirname(STATE_DIR), "ctx")
 CTX_TAIL_BYTES = 4_000_000
 # Prompt-cache lifetime: idling longer than this re-writes the whole context.
-CACHE_TTL_SECONDS = int(os.environ.get("UNTIL_CACHE_TTL_S", 300))
+CACHE_TTL_SECONDS = int(os.environ.get("UNTIL_CACHE_TTL_S", 3600))
 # Exit codes that mean the check itself could not run (not executable /
 # command not found). They say nothing about the goal, so they burn no try.
 BROKEN_CHECK_RCS = (126, 127)

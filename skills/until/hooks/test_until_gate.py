@@ -460,7 +460,7 @@ check("failing probe keeps waiting", "until waiting" in r.get("systemMessage", "
 # 21. idling past the cache lifetime with a big context asks for a handoff
 idle = {**base, "goal": "idle", "check_cmd": "false", "max_tries": 3,
         "tries_used": 0, "waiting_on": [
-            {"id": 1, "what": "overnight soak", "since": NOW, "expect_s": 3600}]}
+            {"id": 1, "what": "overnight soak", "since": NOW, "expect_s": 43200}]}
 write(json.loads(json.dumps(idle)))
 r = gate2(170_000)
 check("long idle at big context blocks", r.get("decision") == "block"
